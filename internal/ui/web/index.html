@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>proxyscope</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>proxyscope</h1>
+  <input id="filter" type="search" placeholder="Filter (method, host, path, status)…" autocomplete="off">
+  <span id="count" class="muted"></span>
+  <span class="spacer"></span>
+  <label class="muted"><input id="autoscroll" type="checkbox" checked> auto-scroll</label>
+  <button id="pause">Pause</button>
+  <button id="clear">Clear history</button>
+  <span id="conn" class="conn ok" title="connection to proxyscope">●</span>
+</header>
+
+<main>
+  <section id="list">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Size</th><th>Time (ms)</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" class="muted empty">No traffic yet. Point your browser's HTTP proxy at the proxy port and load an http:// page.</p>
+  </section>
+
+  <div id="divider" title="Drag to resize"></div>
+
+  <section id="detail">
+    <p id="detail-empty" class="muted empty">Select a request to see its details.</p>
+    <div id="detail-body" hidden>
+      <div id="detail-title"></div>
+      <div id="detail-error" class="error" hidden></div>
+      <div class="panes">
+        <div class="pane"><h2>Request</h2><div id="req"></div></div>
+        <div class="pane"><h2>Response</h2><div id="resp"></div></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

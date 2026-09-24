@@ -1,0 +1,13 @@
+# Build output
+/proxyscope
+/proxyscope.exe
+/dist/
+
+# Captured traffic: sensitive, never commit
+*.db
+*.db-wal
+*.db-shm
+
+# Future phase: MITM CA private key
+/ca/
+*.key
