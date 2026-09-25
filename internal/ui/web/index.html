@@ -13,6 +13,7 @@
     <button data-view="history" class="active">History</button>
     <button data-view="intercept">Intercept <span id="badge" class="badge" hidden>0</span></button>
     <button data-view="repeater">Repeater <span id="rbadge" class="badge quiet" hidden>0</span></button>
+    <button data-view="rules">Rules</button>
   </nav>
   <span class="spacer"></span>
   <a id="ca" href="ca.crt" download="proxyscope-ca.crt" title="Public root CA certificate: install it in your OS/browser trust store to decrypt HTTPS">CA certificate</a>
@@ -34,7 +35,7 @@
     <section id="list">
       <table>
         <thead>
-          <tr><th>#</th><th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Size</th><th>Time (ms)</th><th title="R = replayed from the repeater, E = edited in intercept, N = has a note">Flags</th></tr>
+          <tr><th>#</th><th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Size</th><th>Time (ms)</th><th title="R = replayed from the repeater, E = edited in intercept, M = modified by a match &amp; replace rule, N = has a note">Flags</th></tr>
         </thead>
         <tbody id="rows"></tbody>
       </table>
@@ -80,9 +81,32 @@
   </div>
 </section>
 
+<!-- ===== Rules ===== -->
+<section id="view-rules" class="view" hidden>
+  <div class="toolbar">
+    <button id="rules-new">New rule</button>
+    <button id="rules-raw-toggle">Edit as raw YAML</button>
+    <button id="rules-reload">Reload from file</button>
+    <span id="rules-path" class="muted"></span>
+    <span class="spacer"></span>
+    <span id="rules-msg" class="muted"></span>
+  </div>
+  <div class="split">
+    <aside id="rules-list">
+      <table>
+        <thead><tr><th></th><th>Dir</th><th>ID</th><th>Scope</th><th>Conditions</th><th>Action</th></tr></thead>
+        <tbody id="rules-rows"></tbody>
+      </table>
+      <p id="rules-empty" class="muted empty">No rules yet. Click "New rule", or hand-edit the file and click "Reload from file".</p>
+    </aside>
+    <div id="rules-editor" class="editor"><p class="muted empty">Select a rule to edit, or click "New rule".</p></div>
+  </div>
+</section>
+
 <script src="core.js"></script>
 <script src="history.js"></script>
 <script src="intercept.js"></script>
 <script src="repeater.js"></script>
+<script src="rules.js"></script>
 </body>
 </html>

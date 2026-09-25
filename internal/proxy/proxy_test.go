@@ -65,16 +65,23 @@ func withRootCAs(c Config, pool *x509.CertPool) Config {
 // optional Interceptor enables the live-intercept pause points.
 func startProxy(t *testing.T, cfg Config, icpt ...Interceptor) (*url.URL, *memSink, *ca.Authority) {
 	t.Helper()
+	var ic Interceptor
+	if len(icpt) > 0 {
+		ic = icpt[0]
+	}
+	return startProxyRules(t, cfg, ic, nil)
+}
+
+// startProxyRules is startProxy plus an explicit (possibly nil) RuleEngine,
+// for tests that exercise match & replace.
+func startProxyRules(t *testing.T, cfg Config, icpt Interceptor, re RuleEngine) (*url.URL, *memSink, *ca.Authority) {
+	t.Helper()
 	authority, _, err := ca.LoadOrCreate(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	sink := &memSink{}
-	var ic Interceptor
-	if len(icpt) > 0 {
-		ic = icpt[0]
-	}
-	p := New(cfg, sink, authority, ic, slog.New(slog.DiscardHandler))
+	p := New(cfg, sink, authority, icpt, re, slog.New(slog.DiscardHandler))
 	srv := httptest.NewServer(p)
 	t.Cleanup(func() { p.Shutdown(context.Background()); srv.Close() })
 	u, _ := url.Parse(srv.URL)

@@ -4,9 +4,12 @@
 // by terminating TLS on CONNECT tunnels with per-host certificates from a
 // local CA and relaying the decrypted HTTP/1.1 stream through the same
 // forwarding path (Phase 2, see tunnel.go). Both share forward(), which also
-// hosts the two live-intercept pause points (Phase 3): after the request is
-// fully received and before it is sent upstream, and after the response is
-// fully received and before it is sent to the client. Protocol upgrades
+// hosts the two pause points (Phase 3 live intercept, Phase 4 match &
+// replace rules): after the request is fully received and before it is sent
+// upstream, and after the response is fully received and before it is sent
+// to the client. At each point rules run first (automatically, whether or
+// not intercept is on), then intercept, if enabled, holds the
+// already-rule-transformed message for a human. Protocol upgrades
 // (WebSocket) are answered with a readable 501.
 package proxy
 
@@ -47,6 +50,20 @@ type Interceptor interface {
 	HoldResponse(ctx context.Context, req *model.Request, resp *model.Response) model.Outcome
 }
 
+// RuleEngine is the match & replace pause point, implemented by
+// rules.Engine. A nil RuleEngine means no rules ever run. Unlike Interceptor
+// it never blocks: Apply* runs synchronously and returns the ids of the
+// rules that fired, mutating req/resp in place. It runs whether or not live
+// intercept is enabled, and (at each pause point) before the Interceptor
+// sees the message, so a human reviewing a held item sees the
+// already-rule-transformed version, not the original.
+type RuleEngine interface {
+	NeedsRequestBody() bool
+	NeedsResponseBody() bool
+	ApplyRequest(req *model.Request, bodyAvailable bool) []string
+	ApplyResponse(req *model.Request, resp *model.Response, bodyAvailable bool) []string
+}
+
 // Config holds proxy engine settings.
 type Config struct {
 	Addr         string
@@ -69,6 +86,7 @@ type Proxy struct {
 	sink      Sink
 	issuer    CertIssuer
 	icpt      Interceptor // may be nil
+	re        RuleEngine  // may be nil
 	log       *slog.Logger
 	transport *http.Transport // plain HTTP upstreams
 	server    *http.Server
@@ -83,10 +101,10 @@ type Proxy struct {
 	tunnels  map[*http.Server]struct{}
 }
 
-// New creates a Proxy. icpt may be nil (intercept unavailable). It does not
-// start listening.
-func New(cfg Config, sink Sink, issuer CertIssuer, icpt Interceptor, log *slog.Logger) *Proxy {
-	p := &Proxy{cfg: cfg, out: cfg.Outbound, sink: sink, issuer: issuer, icpt: icpt, log: log, tunnels: map[*http.Server]struct{}{}}
+// New creates a Proxy. icpt and re may each be nil (intercept/rules
+// unavailable). It does not start listening.
+func New(cfg Config, sink Sink, issuer CertIssuer, icpt Interceptor, re RuleEngine, log *slog.Logger) *Proxy {
+	p := &Proxy{cfg: cfg, out: cfg.Outbound, sink: sink, issuer: issuer, icpt: icpt, re: re, log: log, tunnels: map[*http.Server]struct{}{}}
 	p.transport = p.out.Transport()
 	p.server = &http.Server{
 		Handler:           p,
@@ -184,8 +202,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 	}
 
 	// --- Pause point 1: request fully received, nothing sent upstream yet.
-	held := false
-	if p.icpt != nil && p.icpt.RequestEnabled() {
+	needIntercept := p.icpt != nil && p.icpt.RequestEnabled()
+	needRulesBody := p.re != nil && p.re.NeedsRequestBody()
+	buffered := false
+	if needIntercept || needRulesBody {
 		var buf []byte
 		whole := true
 		if body != nil {
@@ -197,14 +217,24 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 			}
 		}
 		if whole {
-			req.Body, held = buf, true
+			req.Body, buffered = buf, true
 		} else {
-			notes = append(notes, "request not intercepted: body larger than -max-body")
+			notes = append(notes, skipNote("request", "body larger than -max-body", needIntercept, needRulesBody))
 			body = io.MultiReader(bytes.NewReader(buf), body)
 		}
 	}
+	// Rules that don't need the body (header/method/host scope only) still
+	// run even when nothing was buffered above; only body-touching rules
+	// require needRulesBody to have forced buffering first.
+	var ruleFired []string
+	if p.re != nil {
+		ruleFired = p.re.ApplyRequest(req, buffered)
+		if len(ruleFired) > 0 {
+			ex.RulesApplied = append(ex.RulesApplied, ruleFired...)
+		}
+	}
 	origBase := r.URL.Scheme + "://" + r.URL.Host
-	if held {
+	if buffered && needIntercept {
 		oc := p.icpt.HoldRequest(ctx, req)
 		if oc.Note != "" {
 			notes = append(notes, oc.Note)
@@ -220,13 +250,19 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 		}
 		if oc.Edited {
 			ex.ReqEdited = true
-			recordEditedRequest(ex, req)
 		}
+	}
+	if buffered || len(ruleFired) > 0 {
+		// The stored copy must describe what was actually sent, whether a
+		// rule, intercept, both, or (for a held-but-unmodified item) neither
+		// changed it.
+		recordEditedRequest(ex, req, buffered)
 	}
 
 	// A different scheme or host than the client asked for needs a transport
-	// with matching TLS settings (the caller's may be pinned to another name).
-	if held && ex.ReqEdited {
+	// with matching TLS settings (the caller's may be pinned to another
+	// name). Only intercept edits can change the URL; rule actions cannot.
+	if ex.ReqEdited {
 		if u, err := url.Parse(req.URL); err == nil && u.Scheme+"://"+u.Host != origBase {
 			tr = p.out.Transport()
 			defer tr.CloseIdleConnections()
@@ -236,7 +272,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 	var outBody io.Reader
 	var outLen int64
 	switch {
-	case held:
+	case buffered:
 		if len(req.Body) > 0 {
 			reqCap.Write(req.Body)
 			outBody, outLen = bytes.NewReader(req.Body), int64(len(req.Body))
@@ -272,10 +308,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 	deliver := &model.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone()}
 
 	// --- Pause point 2: response fully received, nothing sent to the client yet.
-	heldResp := false
-	if p.icpt != nil && p.icpt.ResponseEnabled() {
+	needInterceptResp := p.icpt != nil && p.icpt.ResponseEnabled()
+	needRulesRespBody := p.re != nil && p.re.NeedsResponseBody()
+	bufferedResp := false
+	if needInterceptResp || needRulesRespBody {
 		if reason := notHoldable(resp, p.cfg.MaxBodyBytes); reason != "" {
-			notes = append(notes, "response not intercepted: "+reason)
+			notes = append(notes, skipNote("response", reason, needInterceptResp, needRulesRespBody))
 		} else {
 			buf, whole, err := outbound.ReadUpTo(resp.Body, p.cfg.MaxBodyBytes)
 			switch {
@@ -289,9 +327,9 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 				plainError(w, ex.StatusCode, ex.Error)
 				return
 			case whole:
-				deliver.Body, heldResp = buf, true
+				deliver.Body, bufferedResp = buf, true
 			default:
-				notes = append(notes, "response not intercepted: body larger than -max-body")
+				notes = append(notes, skipNote("response", "body larger than -max-body", needInterceptResp, needRulesRespBody))
 				resp.Body = struct {
 					io.Reader
 					io.Closer
@@ -299,7 +337,16 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 			}
 		}
 	}
-	if heldResp {
+	// Rules that don't need the body (status/header scope only) still run
+	// even when nothing was buffered above, exactly like the request side.
+	var respRuleFired []string
+	if p.re != nil {
+		respRuleFired = p.re.ApplyResponse(req, deliver, bufferedResp)
+		if len(respRuleFired) > 0 {
+			ex.RulesApplied = append(ex.RulesApplied, respRuleFired...)
+		}
+	}
+	if bufferedResp && needInterceptResp {
 		oc := p.icpt.HoldResponse(ctx, req, deliver)
 		if oc.Note != "" {
 			notes = append(notes, oc.Note)
@@ -314,6 +361,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 			return
 		}
 		ex.RespEdited = oc.Edited
+	}
+	if bufferedResp || len(respRuleFired) > 0 {
+		// The stored copy must describe what was actually delivered, whether
+		// a rule, intercept, both, or neither changed it.
 		ex.StatusCode, ex.RespHeaders = deliver.StatusCode, deliver.Header.Clone()
 	}
 
@@ -322,7 +373,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 		h[k] = append([]string(nil), vv...)
 	}
 	outbound.RemoveHopByHop(h)
-	if heldResp {
+	if bufferedResp {
 		// The body is fully buffered, so the length is known (and may have been edited).
 		canHaveBody := bodyAllowed(req.Method, deliver.StatusCode)
 		if canHaveBody {
@@ -352,15 +403,37 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 	}
 }
 
-// recordEditedRequest makes the stored exchange describe what was actually sent.
-func recordEditedRequest(ex *model.Exchange, req *model.Request) {
+// skipNote explains why a request/response body could not be buffered for
+// rules and/or intercept (too large, or a streaming response), naming
+// whichever of the two features actually needed it, e.g. "response not
+// intercepted/rule-processed: body larger than -max-body".
+func skipNote(what, reason string, needIntercept, needRules bool) string {
+	var skipped []string
+	if needIntercept {
+		skipped = append(skipped, "intercepted")
+	}
+	if needRules {
+		skipped = append(skipped, "rule-processed")
+	}
+	return fmt.Sprintf("%s not %s: %s", what, strings.Join(skipped, "/"), reason)
+}
+
+// recordEditedRequest makes the stored exchange describe what was actually
+// sent: req may be unchanged (a held-but-forwarded-as-is item), rule-edited,
+// intercept-edited, or both. syncContentLength must be false when req.Body
+// was never buffered (e.g. only a header-only rule fired): in that case
+// req.Body is empty regardless of whether the real (still-streaming) body is,
+// and correcting Content-Length from it would wrongly report "no body".
+func recordEditedRequest(ex *model.Exchange, req *model.Request, syncContentLength bool) {
 	ex.Method, ex.URL = req.Method, req.URL
 	if u, err := url.Parse(req.URL); err == nil {
 		ex.Host, ex.Path = u.Host, u.RequestURI()
 	}
 	ex.ReqHeaders = req.Header.Clone()
 	ex.ReqHeaders.Del("Host") // like live traffic: the host is shown separately
-	outbound.SyncContentLength(ex.ReqHeaders, len(req.Body))
+	if syncContentLength {
+		outbound.SyncContentLength(ex.ReqHeaders, len(req.Body))
+	}
 }
 
 // notHoldable says why a response must stream through instead of being held

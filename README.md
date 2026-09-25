@@ -12,8 +12,8 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 |-------|-------|-------|
 | 1 | Plain HTTP proxy, SQLite history, web UI | **Implemented** |
 | 2 | HTTPS via TLS MITM with a custom local CA | **Implemented** |
-| 3 | Live intercept (pause/edit/forward/drop) + Repeater | **Implemented (this version)** |
-| 4 | Match & replace rules | Not started |
+| 3 | Live intercept (pause/edit/forward/drop) + Repeater | **Implemented** |
+| 4 | Match & replace rules | **Implemented (this version)** |
 | 5 | Generic TCP/UDP relay (separate module) | Not started |
 
 ### What works now
@@ -24,7 +24,8 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 - Every exchange is stored in SQLite: method, full URL, request/response headers, request/response bodies, timestamp, status code, duration, and an error message when no response could be obtained.
 - **Live intercept** (default off): hold every request after it is fully received and before it goes upstream, and/or hold every response before it goes to the client. Inspect and edit method, URL, headers, body (or status, headers, body for responses), then **Forward**, **Forward edited** or **Drop**. Works identically for HTTP and decrypted HTTPS, and many requests can be held at once. See [Live intercept](#live-intercept).
 - **Repeater**: "Send to Repeater" on any history row opens an editable copy that you can tweak and re-send as often as you like; each result is stored in history marked as *replayed*. See [Repeater](#repeater).
-- Web UI: three tabs (History, Intercept, Repeater); history table with click-for-detail, near-real-time updates by polling, client-side filter, "hide replayed", pause, clear history, CA download link.
+- **Match & replace rules** (default: none configured): structured, declarative rules loaded from a YAML file automatically rewrite matching requests/responses (headers, body, status code) with no manual intervention, independently of whether live intercept is on. This is what makes automated, scripted traffic tampering possible (e.g. spoofing a license-check response for reverse engineering) without touching the target binary. See [Match & replace rules](#match--replace-rules).
+- Web UI: four tabs (History, Intercept, Repeater, Rules); history table with click-for-detail, near-real-time updates by polling, client-side filter, "hide replayed", pause, clear history, CA download link.
 - The UI decodes `gzip`/`deflate` response bodies for display and shows binary bodies as a hex dump. The stored body is always the raw bytes from the wire.
 - Network and TLS errors never crash the proxy. Unreachable host, DNS failure, refused connection, timeouts and invalid upstream certificates are logged, stored, and returned to the client as a readable plain-text `502`/`504` (also inside TLS tunnels). A client that refuses the ProxyScope certificate produces a `CONNECT` row with an explanatory error and a log warning; nothing hangs.
 
@@ -40,11 +41,13 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 - Successful `CONNECT` tunnels are not recorded as their own rows (only the decrypted requests inside them are). Failed tunnels are.
 - No proxy authentication, no upstream proxy chaining, no client-certificate (mTLS) forwarding.
 - Intercept: bodies larger than `-max-body` and streaming responses (`text/event-stream`) are **not held**; they flow through untouched and the history row gets a note. Binary bodies can be held and forwarded/dropped and their headers edited, but not edited as text. Held bodies are buffered in memory (up to `-max-body` each). The intercept toggles and held items are in memory only: they reset when ProxyScope restarts. Scope/filter rules ("intercept only matching requests") do not exist yet; intercept applies to all requests. See [Live intercept](#live-intercept) and [Repeater](#repeater) for more details.
+- Rules: like intercept, a rule whose condition or action touches the body **never fires** on a body larger than `-max-body` or a streaming (`text/event-stream`) response — it cannot see or usefully rewrite what it never buffered, so the message flows through untouched and the history row gets a note; header/status-only rules are unaffected by this limit. A rule cannot decompress a `gzip`/`deflate` body to match/replace its logical content: matching/replacement always operates on the raw wire bytes, so a compressed body needs a companion request-direction rule that strips/rewrites `Accept-Encoding` so the upstream sends it uncompressed in the first place (see the example below). Each rule has exactly one action (chain several rules for multiple effects). Conditions are AND-only; there is no OR/grouping yet. `scope.host` matches the hostname only (no port); `scope.path` matches the URL path only (no query string). Rules **do not run on Repeater sends** (the repeater bypasses the proxy listener and the intercept queue by design, and now the rule engine too). Reordering rules is done by editing the YAML array order (by hand, or via "Edit as raw YAML" in the UI); there is no drag-to-reorder list.
 
 ## Requirements
 
 - Go **1.25 or newer** (`go version`).
-- Nothing else. SQLite is provided by [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite), a pure-Go driver, so **no CGO / C compiler is needed** on either OS. TLS and certificates use Go's standard library.
+- SQLite is provided by [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite), a pure-Go driver, so **no CGO / C compiler is needed** on either OS. TLS and certificates use Go's standard library.
+- The match & replace rules file is parsed with [`gopkg.in/yaml.v3`](https://pkg.go.dev/gopkg.in/yaml.v3) (pure Go, no CGO) — the standard library has no YAML support.
 
 ## Install and run
 
@@ -85,6 +88,7 @@ Command-line flags (run `proxyscope -h` for the list):
 | `-ca-dir` | see [CA location](#where-the-ca-lives) | Directory of the root CA (`ca.crt`, `ca.key`); generated if missing |
 | `-export-ca` | *(unset)* | Write the public CA certificate (PEM) to this path and exit |
 | `-insecure-upstream` | `false` | **Do not validate upstream servers' TLS certificates** |
+| `-rules-file` | see [Match & replace rules](#match--replace-rules) | Match & replace rules file (YAML); a missing file means no rules, a malformed one refuses to start |
 
 Both listeners bind to **loopback only** by default, because captured traffic contains credentials and cookies. Binding to `0.0.0.0` (e.g. to proxy a phone on your LAN) is possible via the flags but exposes an unauthenticated proxy and UI to your network. Do that only on networks you trust.
 
@@ -200,7 +204,7 @@ curl --cacert ~/.config/ekisde.dev/Proxy/ca/ca.crt -x http://127.0.0.1:8080 http
    - **Brave/Chrome/Edge**: they use the OS proxy settings (Windows: Settings → Network → Proxy; Linux: system proxy settings or `--proxy-server="127.0.0.1:8080"`). They bypass the proxy for localhost by default. Brave's Tor private windows use Tor instead and do not go through your proxy.
    - **curl**: `curl -x http://127.0.0.1:8080 http://example.com/` (add `--cacert` for HTTPS as above).
 3. Install the CA (previous section) for HTTPS.
-4. Open `http://127.0.0.1:8081` and browse. To pause and edit traffic, use the **Intercept** tab; to replay a request, use **Send to Repeater** on a history row (both below).
+4. Open `http://127.0.0.1:8081` and browse. To pause and edit traffic, use the **Intercept** tab; to replay a request, use **Send to Repeater** on a history row; to have traffic rewritten automatically, use the **Rules** tab (all below).
 
 ## Live intercept
 
@@ -259,6 +263,115 @@ Details and limits:
 - Network failures (refused, DNS, timeout, invalid upstream certificate) are results, not popups: the row is stored with status `ERR` and the error text.
 - Security: the repeater can send requests to any address your machine can reach, including internal ones. The UI is loopback-only and protected by the Host/`X-Requested-With` checks below; keep it that way.
 
+## Match & replace rules
+
+Automated, scripted traffic tampering: a rule matches on structured conditions (host/path/method/direction, headers, body, status) and applies one action (rewrite a header, rewrite the body, change the status code) with no manual step. Unlike live intercept, rules run **whether or not the intercept toggles are on** — you can have rules running silently in the background, manual intercept for the requests you want to eyeball, or both together (see [Interaction with live intercept](#interaction-with-live-intercept) below). This is the feature for the crackme/reverse-engineering use case: point ProxyScope at a license/verification server, write one rule, and every check comes back "valid" automatically without touching the target binary.
+
+### The rules file
+
+Rules live in a single YAML file, loaded on startup and treated as the **single source of truth**: it is safe to commit to git, hand-edit, or share with a team, and every change made through the UI is written straight back to this same file (never only to SQLite).
+
+- Default location: `<user config dir>/ekisde.dev/Proxy/rules.yaml` — same base directory as the CA (`%AppData%\ekisde.dev\Proxy\rules.yaml` on Windows, `~/.config/ekisde.dev/Proxy/rules.yaml` on Arch — see [Where the CA lives](#where-the-ca-lives)), but its own file, not inside the `ca/` directory.
+- Override with `-rules-file /path/to/rules.yaml`.
+- A **missing** file is not an error: ProxyScope starts with zero rules (a fresh install). A file that **exists but is malformed** (bad YAML, a regex that doesn't compile, an impossible condition, an action referencing a capture group its own pattern doesn't have, ...) makes ProxyScope **refuse to start**, with a specific, readable error naming the offending rule. The same validation runs on every save from the UI: an invalid save is rejected (`400` with the error message) and the previously active rules keep running untouched — a bad edit can never blank out a working rule set.
+
+### Schema
+
+```yaml
+version: 1
+rules:
+  - id: unique-id              # required, unique; letters/digits/-/_/. only
+    name: "Human label"        # optional, shown in the UI (defaults to id)
+    enabled: true               # per-rule on/off toggle
+    direction: request          # "request" or "response"
+    scope:                      # all fields optional; empty = matches anything
+      host: "example.com"       # exact hostname, or "*.example.com" for it + subdomains (no port)
+      path: "/api/path"         # matched per path_match, against the URL path only (no query string)
+      path_match: exact         # exact | prefix | regex (default: exact)
+      method: POST               # exact HTTP method, case-insensitive
+    conditions:                  # optional, AND-combined (no OR/grouping yet)
+      - type: header             # header | body | status
+        name: X-Example          # header condition only
+        match: exact              # header: exact|contains|regex ; body: contains|regex
+        value: "..."              # literal value, or a regex when match: regex
+      - type: status              # response-direction rules only
+        equals: 200
+    action:                      # exactly one per rule; chain rules for more effects
+      type: replace_header        # replace_header | add_header | remove_header |
+                                   # replace_body | body_regex_replace | set_status
+      name: X-Example             # header actions
+      value: "..."                # replace_header / add_header
+      body: "..."                 # replace_body: literal new full body
+      pattern: "..."              # body_regex_replace: regex to find
+      replacement: "$1"           # body_regex_replace: replacement, may use $1/${name} capture groups from pattern
+      status: 200                 # set_status: response-direction rules only
+```
+
+### Example: crackme license-check bypass
+
+```yaml
+version: 1
+rules:
+  # Request direction: strip the client-side integrity header the app sends
+  # on every call, so the server never even sees it was tampered with.
+  - id: strip-integrity-header
+    name: "Drop client integrity header"
+    enabled: true
+    direction: request
+    scope:
+      host: license.example.com
+      path: /api/activate
+      method: POST
+    action:
+      type: remove_header
+      name: X-App-Integrity
+
+  # Response direction: whatever the real server says, force the
+  # verification result to "valid".
+  - id: verify-bypass
+    name: "Force verification response to valid"
+    enabled: true
+    direction: response
+    scope:
+      host: license.example.com
+      path: /api/verify
+    conditions:
+      - type: status
+        equals: 200
+      - type: body
+        match: regex
+        value: '"valid"\s*:\s*false'
+    action:
+      type: replace_body
+      body: '{"valid": true, "reason": "ok"}'
+```
+
+If the server compresses that response (`Content-Encoding: gzip`), add a third, request-direction rule that removes or rewrites `Accept-Encoding` so it is asked for uncompressed instead (rules match/replace raw wire bytes, not decompressed content — see [Known limitations](#known-limitations)).
+
+### Evaluation order
+
+**Array order in the YAML file is evaluation order.** Rules run top to bottom; every rule matching a given request/response applies in order, and each one sees the **result of the previous one's edits** (so a later rule's conditions can match text a previous action just introduced). A rule only ever runs at its own `direction`: a `request` rule never sees responses and vice versa. There is one such pass at each of the two pause points already used by live intercept (see [Architecture](#architecture)): once for the request, before it goes upstream, and once for the response, before it goes to the client.
+
+### Interaction with live intercept
+
+**Rules run first, then live intercept (if enabled) holds the already-rule-transformed message.** Concretely, at each pause point: rules are applied automatically and unconditionally (independent of the intercept toggles) → *then*, if the matching intercept toggle is on, the (possibly rule-modified) request/response is held for you to inspect/edit/forward/drop as usual. This means:
+
+- Rules alone (intercept off): fully automated, no UI interaction needed — the point of this feature.
+- Intercept alone (no rules configured): behaves exactly like Phase 3, unchanged.
+- Both together: you see and can further edit what the rules already produced, not the original — so a human reviewing a held item always sees the final, post-automation state, and can override or refine what the rules did before it goes out.
+
+Rules never run on **Repeater** sends: like live intercept, the repeater bypasses the proxy listener entirely by design.
+
+### Performance
+
+Every regex (in scopes, conditions, and `body_regex_replace` actions) is compiled exactly once — when the rules file is loaded, reloaded, or saved from the UI — never per request. A rule whose condition or action does not touch the body (header/status-only rules) never forces the request/response body to be buffered, so a ruleset with only header/status rules adds no memory or latency cost beyond evaluating a handful of string/regex comparisons per message.
+
+### The Rules tab
+
+Lists every rule (enabled toggle, direction, scope/condition/action summary); click one to edit it in a structured form matching the schema above (scope, AND-combined conditions, one action), or use **Edit as raw YAML** to edit/paste the whole file's text directly (useful for reordering rules or keeping hand-written comments — the structured form regenerates the file without them). **New rule** starts a blank one; **Save** validates before writing anything (see above); **Delete** removes a rule. **Reload from file** re-reads `rules.yaml` from disk, for when you hand-edit it outside the UI (a save from the UI itself takes effect immediately without needing this button).
+
+When a rule fires on live traffic, the affected history row gets an **M** flag (next to R for replayed and E for edited) and the detail view shows a banner naming which rule(s) fired, in firing order — so after the fact it's obvious which traffic was auto-modified and by what.
+
 ## Troubleshooting
 
 ### Requests are missing, or responses look different, in Brave (Shields)
@@ -276,31 +389,36 @@ The same logic applies to other browsers' built-in blockers and to extensions (a
 ## Architecture
 
 ```
-cmd/proxyscope/        main: parse flags, load/create the CA, wire packages, run both servers, graceful shutdown
+cmd/proxyscope/        main: parse flags, load/create the CA, load rules, wire packages, run both servers, graceful shutdown
 internal/
-  model/               Shared types (Exchange, Summary, intercept Request/Response/Outcome/Pending...); no internal deps
-  config/              Flag parsing into a Config struct (incl. default CA directory)
+  model/               Shared types (Exchange, Summary, intercept Request/Response/Outcome/Pending,
+                       match & replace Rule/Scope/Condition/Action...); no internal deps
+  config/              Flag parsing into a Config struct (incl. default CA directory, default rules file)
   ca/                  Root CA generation/loading, leaf certificate issuing + cache, name validation, cert export
   outbound/            Talking to upstream servers, shared by proxy and repeater: transports, timeouts,
                        upstream TLS validation, request building, hop-by-hop stripping, body capture, error classification
   intercept/           Live intercept queue (Manager): pause points, held items, timeout, resolve/drop
+  rules/               Match & replace engine (Engine): YAML load/validate/compile, scope + condition
+                       matching, action application, atomic reload; see "Match & replace rules" above
   proxy/               Proxy engine
-    proxy.go             http.Handler, forward() (used by HTTP and HTTPS; hosts both pause points)
+    proxy.go             http.Handler, forward() (used by HTTP and HTTPS; hosts both pause points:
+                         rules always run first, then intercept if enabled)
     tunnel.go            CONNECT handling: hijack, TLS handshake with the client (SNI), per-tunnel HTTP server
     headers.go           Upgrade detection
-  repeater/            Direct re-send of an edited request; stores the result as "replayed"
+  repeater/            Direct re-send of an edited request; stores the result as "replayed"; no rules, no intercept
   store/               SQLite persistence (Save/List/Get/Clear), schema versioning
   ui/                  Web UI server + JSON API
     ui.go                routes, host/CSRF guard, CA download, history detail view
     intercept.go         /api/intercept handlers (state, settings, item detail, forward/drop)
     repeater.go          repeater seed + send handlers
+    rules.go             /api/rules handlers (structured save, raw YAML save, reload)
     edit.go              edit forms <-> model types: header text, body edit rules, validation
     body.go              body rendering for the browser (gzip/deflate decode, hex dump)
     web/                 embedded static frontend: index.html, style.css,
-                         core.js (helpers, tabs, detail renderer), history.js, intercept.js, repeater.js
+                         core.js (helpers, tabs, detail renderer), history.js, intercept.js, repeater.js, rules.js
 ```
 
-Dependency direction: `cmd` → everything; `proxy`, `ui` and `repeater` depend on `model`, `outbound` (proxy, repeater) and on small interfaces they define themselves (`proxy.Sink`, `proxy.CertIssuer`, `proxy.Interceptor`, `ui.Store`, `ui.Interceptor`, `ui.Repeater`) that `store.Store`, `ca.Authority`, `intercept.Manager` and `repeater.Service` satisfy. `store`, `ca`, `outbound` and `intercept` are leaves (they depend at most on `model`). Nothing depends on `cmd`. All private-key handling is confined to the `ca` package. `proxy` and `repeater` never import each other, and the repeater never touches the proxy or the intercept queue.
+Dependency direction: `cmd` → everything; `proxy`, `ui` and `repeater` depend on `model`, `outbound` (proxy, repeater) and on small interfaces they define themselves (`proxy.Sink`, `proxy.CertIssuer`, `proxy.Interceptor`, `proxy.RuleEngine`, `ui.Store`, `ui.Interceptor`, `ui.Repeater`, `ui.Rules`) that `store.Store`, `ca.Authority`, `intercept.Manager`, `repeater.Service` and `rules.Engine` satisfy. `store`, `ca`, `outbound`, `intercept` and `rules` are leaves (they depend at most on `model`). Nothing depends on `cmd`. All private-key handling is confined to the `ca` package. `proxy` and `repeater` never import each other, and the repeater never touches the proxy, the intercept queue, or the rule engine. The match & replace rule types (`Rule`, `Scope`, `Condition`, `Action`, ...) live in `model`, not in `rules`, so `ui` and `proxy` never need to import `internal/rules` directly — the same reason `Request`/`Response`/`Outcome` live in `model` for intercept.
 
 ### Request flow
 
@@ -310,7 +428,7 @@ Dependency direction: `cmd` → everything; `proxy`, `ui` and `repeater` depend 
 
 Both paths use `http.Transport.RoundTrip` directly (no redirect following, no cookie jar, no compression handling, no env proxies), so redirects and encodings reach the client untouched. The UI polls `GET /api/exchanges?after=<lastId>` and loads detail with `GET /api/exchanges/{id}`.
 
-**Inside `forward` (Phase 3):** receive the request → *[pause point 1, if request intercept is on: read the whole body (≤ `-max-body`), hold, apply edits or drop]* → build the outbound request (`outbound.BuildRequest`) → `RoundTrip` upstream → *[pause point 2, if response intercept is on: read the whole body (≤ `-max-body`), hold, apply edits or drop]* → relay to the client (streamed normally when not held) → save one `model.Exchange`. Phase 4's match & replace is intended to run at these same two points (before the hold).
+**Inside `forward` (Phase 3 + 4):** receive the request → *[pause point 1: if a rule needs the body or request intercept is on, read the whole body (≤ `-max-body`); apply every matching request-direction rule in file order; if request intercept is on, hold the (rule-transformed) request, apply edits or drop]* → build the outbound request (`outbound.BuildRequest`) → `RoundTrip` upstream → *[pause point 2: same thing for the response — rules first, then intercept if enabled]* → relay to the client (streamed normally when nothing needed the body) → save one `model.Exchange`, including which rule(s) fired. A rule that doesn't need the body (header/status-only) still runs even when nothing was buffered.
 
 **Repeater:** UI → `POST /api/repeater/send` → validate the edit form → `repeater.Service.Send` → `outbound.BuildRequest` + shared transport → store the result with `source = repeater`. No listener, no intercept queue.
 
@@ -329,6 +447,10 @@ Both paths use `http.Transport.RoundTrip` directly (no redirect following, no co
 | POST | `/api/intercept/{id}/drop` | Drop the item (client gets a `403`). |
 | GET | `/api/exchanges/{id}/repeater` | Editable copy of a stored request for the repeater. |
 | POST | `/api/repeater/send` | Body `{sourceId,method,url,headers,body}`; sends directly and returns the stored result in history-detail shape. |
+| GET | `/api/rules` | `{path, rules, raw}`: the rules file's path, structured rules (file order), and raw YAML text. |
+| PUT | `/api/rules` | Body `{rules:[...]}`; replaces the whole structured rule list. `400` with a readable error on an invalid rule (previous rules keep running); success returns the same shape as `GET`. |
+| PUT | `/api/rules/raw` | Body `{yaml:"..."}`; replaces the file's raw text verbatim (preserves comments/formatting). Same validation/response as above. |
+| POST | `/api/rules/reload` | Re-reads the rules file from disk (for hand-edits made outside the UI). Same validation/response as above. |
 
 Every non-GET request must carry the header `X-Requested-With: proxyscope`.
 
@@ -336,7 +458,9 @@ Security notes: when the UI is bound to loopback, requests whose `Host` is not a
 
 ### Database
 
-SQLite file (`-db`), WAL mode, one table `exchanges`; headers are stored as JSON, bodies as BLOBs, timestamps/durations as integer nanoseconds. Schema version is kept in `PRAGMA user_version` (currently **2**). HTTPS is distinguished by the `https://` URL prefix, and failed TLS handshakes are stored as `CONNECT` rows with status 0 and an `error`. **Phase 3 added schema v2** with four columns: `source` (`proxy` = live-captured, `repeater` = replayed), `req_edited` and `resp_edited` (modified in the intercept queue; the stored copy is what was actually sent/delivered), and `note` (non-error annotations such as auto-forwarded or not intercepted). An existing v1 database is migrated automatically on startup (in one transaction; old rows become `source = 'proxy'`). **Databases created by Phase 3 cannot be opened by older versions** (they refuse a newer schema). Add a migration step in `store.migrate` when changing the schema. Ids use `AUTOINCREMENT`, so they are never reused after "Clear history". You can inspect the file with any SQLite client (`sqlite3 proxyscope.db`). The database contains decrypted traffic (credentials, cookies): protect and delete it accordingly.
+SQLite file (`-db`), WAL mode, one table `exchanges`; headers are stored as JSON, bodies as BLOBs, timestamps/durations as integer nanoseconds. Schema version is kept in `PRAGMA user_version` (currently **3**). HTTPS is distinguished by the `https://` URL prefix, and failed TLS handshakes are stored as `CONNECT` rows with status 0 and an `error`. **Phase 3 added schema v2** with four columns: `source` (`proxy` = live-captured, `repeater` = replayed), `req_edited` and `resp_edited` (modified in the intercept queue; the stored copy is what was actually sent/delivered), and `note` (non-error annotations such as auto-forwarded or not intercepted). **Phase 4 added schema v3** with two columns: `rule_fired` (cheap boolean for the history list's **M** flag) and `rules_applied` (JSON array of the rule ids that fired, in firing order, used by the detail view). An existing v1 or v2 database is migrated automatically on startup (each in its own transaction; old rows get `rule_fired = 0`, `rules_applied = '[]'`). **A database written by a newer schema version cannot be opened by an older ProxyScope** (it refuses a newer schema). Add a migration step in `store.migrate` when changing the schema. Ids use `AUTOINCREMENT`, so they are never reused after "Clear history". You can inspect the file with any SQLite client (`sqlite3 proxyscope.db`). The database contains decrypted traffic (credentials, cookies): protect and delete it accordingly.
+
+Match & replace rules themselves are **not** stored in SQLite: the YAML file (see [Match & replace rules](#match--replace-rules)) is the single source of truth, on purpose, so it stays version-controllable and shareable. Only the *effect* of a rule firing on a given exchange (which rule id(s), in `rules_applied`) is recorded in the database.
 
 ## Windows vs Linux
 
@@ -354,9 +478,9 @@ Any future OS-specific code must live in a clearly named file (`*_windows.go` / 
 
 | | Windows | Arch Linux |
 |---|---|---|
-| Builds, unit tests, end-to-end runs | Yes, on every phase | Phase 1 was build-tested; **Phases 2 and 3 have only been cross-compiled (`GOOS=linux`), not built, tested or run on Arch** |
+| Builds, unit tests, end-to-end runs | Yes, on every phase | Phase 1 was build-tested; **Phases 2-4 have only been cross-compiled (`GOOS=linux`), not built, tested or run on Arch** |
 
-Phase 3 deliberately adds nothing platform-specific: no syscalls, no file locking, no OS-specific paths; it uses only the standard library and the same pure-Go SQLite driver (the schema migration is plain SQL). The intercept queue, repeater and UI are platform-independent Go and JavaScript. Even so, treat **Phase 3 on Arch as unverified**: on your first run there, do `go vet ./... && go test ./...` and then try one intercepted request and one repeater send before relying on it. The same applies to the Phase 2 CA / NSS trust-store steps (see above).
+Phase 4 deliberately adds nothing platform-specific: no syscalls, no file locking, no OS-specific paths; it uses the standard library plus the pure-Go `gopkg.in/yaml.v3` (no CGO, same as the SQLite driver). The rules file lives next to the CA directory using the same `os.UserConfigDir()` layout already used (and cross-compile-verified) since Phase 2, and rules are reloaded with a plain file write + rename, not a platform-specific file-watch API (see [Match & replace rules](#match--replace-rules) for why a UI button was chosen over file-watching). Even so, treat **Phase 4 on Arch as unverified**: on your first run there, do `go vet ./... && go test ./...` and then load a rule, confirm it fires on a real request, and edit it via both the structured form and raw YAML before relying on it. The same applies to Phases 2-3 (see above).
 
 ## Development
 
@@ -366,9 +490,8 @@ go test ./...          # add -race where a C compiler is available
 gofmt -l .             # must print nothing
 ```
 
-Tests cover forwarding, chunked bodies in both directions, body truncation, connection-refused → 502, header timeout → 504, CA creation/reload/tamper detection, leaf issuing/verification/caching and name validation, full HTTPS interception (decrypt, record, keep-alive), upstream validation on/off, a client rejecting the fake certificate, a client vanishing mid-handshake, invalid SNI, CONNECT target parsing, the SQLite round trip and the v1 → v2 migration, body rendering, and the UI guard. Phase 3 adds tests for the intercept manager (edit, drop, timeout, client disconnect, releasing on toggle-off, 25 concurrent held requests resolved out of order), the pause points in the real proxy (request/response edit and drop over HTTP and HTTPS, editing the target host, oversized/streaming bodies not held, a held request not blocking others), the intercept and repeater APIs (including invalid edits leaving the item held), body edit rules (gzip, CRLF), and the repeater (replayed marking, no redirect following, error results, upstream validation flag, body cap). See `CLAUDE.md` for repo conventions (also intended for future Claude sessions).
+Tests cover forwarding, chunked bodies in both directions, body truncation, connection-refused → 502, header timeout → 504, CA creation/reload/tamper detection, leaf issuing/verification/caching and name validation, full HTTPS interception (decrypt, record, keep-alive), upstream validation on/off, a client rejecting the fake certificate, a client vanishing mid-handshake, invalid SNI, CONNECT target parsing, the SQLite round trip and the v1 → v2 migration, body rendering, and the UI guard. Phase 3 adds tests for the intercept manager (edit, drop, timeout, client disconnect, releasing on toggle-off, 25 concurrent held requests resolved out of order), the pause points in the real proxy (request/response edit and drop over HTTP and HTTPS, editing the target host, oversized/streaming bodies not held, a held request not blocking others), the intercept and repeater APIs (including invalid edits leaving the item held), body edit rules (gzip, CRLF), and the repeater (replayed marking, no redirect following, error results, upstream validation flag, body cap). Phase 4 adds tests for the rules engine (validation errors including malformed regex/impossible conditions/bad capture-group references, scope matching including wildcard hosts and path prefix/regex, every condition and action type, multi-rule ordering where a later rule sees an earlier one's edit, a body-touching rule never firing without a buffered body, atomic reload where a bad file leaves the previous rules running), the pause points (a rule firing with intercept off, rules running before an enabled intercept hold sees the message, a header-only rule not forcing body buffering, the oversized-body skip note), the rules API (structured save, raw YAML save, reload, validation failures leaving the previous rules active), and the v2 → v3 migration. See `CLAUDE.md` for repo conventions (also intended for future Claude sessions).
 
 ## Roadmap (not implemented)
 
-- **Phase 4**: match & replace rules on requests/responses.
 - **Phase 5**: generic TCP/UDP relay as a separate module in the same project.

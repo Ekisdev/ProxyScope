@@ -28,6 +28,7 @@ func sample(n int) *model.Exchange {
 		RespHeaders:  http.Header{"Content-Type": {"text/plain"}},
 		RespBody:     []byte("hi"),
 		RespBodySize: 10, // larger than stored: truncated
+		RulesApplied: []string{"rule-" + string(rune('a'+n))},
 	}
 }
 
@@ -56,6 +57,9 @@ func TestSaveGetListClear(t *testing.T) {
 	if got.Path != "/b" || got.ReqHeaders.Values("X-A")[1] != "2" || string(got.RespBody) != "hi" ||
 		!got.RespBodyTruncated() || got.Duration != 1500*time.Microsecond || len(got.ReqBody) != 3 {
 		t.Fatalf("round trip mismatch: %+v", got)
+	}
+	if !got.RuleFired() || len(got.RulesApplied) != 1 || got.RulesApplied[0] != "rule-b" {
+		t.Fatalf("rules applied round trip mismatch: %+v", got.RulesApplied)
 	}
 
 	if _, err := s.Get(ctx, 99); !errors.Is(err, model.ErrNotFound) {
@@ -106,7 +110,7 @@ func TestSchemaV1DatabaseIsMigrated(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 	got, err := s.Get(ctx, 1)
-	if err != nil || got.Source != model.SourceProxy || got.ReqEdited || got.Note != "" {
+	if err != nil || got.Source != model.SourceProxy || got.ReqEdited || got.Note != "" || got.RuleFired() {
 		t.Fatalf("migrated row = %+v err=%v", got, err)
 	}
 
@@ -133,4 +137,46 @@ func TestSchemaV1DatabaseIsMigrated(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	s2.Close()
+}
+
+func TestSchemaV2DatabaseIsMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// Build a schema-v2 database (as created by Phase 3) with one row.
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(schemaV1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(schemaV2); err != nil {
+		t.Fatal(err)
+	}
+	_, err = old.Exec(`INSERT INTO exchanges (ts_ns, duration_ns, method, url, host, path, proto, req_headers, req_body_size, status, resp_headers, resp_body_size, source, req_edited, resp_edited, note)
+		VALUES (1, 2, 'GET', 'http://old/', 'old', '/', 'HTTP/1.1', '{}', 0, 200, '{}', 0, 'proxy', 0, 0, '')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Exec("PRAGMA user_version = 2")
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	got, err := s.Get(ctx, 1)
+	if err != nil || got.RuleFired() || len(got.RulesApplied) != 0 {
+		t.Fatalf("migrated row = %+v err=%v", got, err)
+	}
+
+	ex := sample(0)
+	if err := s.Save(ctx, ex); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := s.List(ctx, 0, 10)
+	if all[0].RuleFired || !all[1].RuleFired {
+		t.Fatalf("summaries = %+v", all)
+	}
 }

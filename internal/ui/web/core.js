@@ -71,6 +71,9 @@
     if (d.source === 'repeater') frag.appendChild(el('div', 'Replayed from the repeater — not live-captured traffic.', 'banner replay'));
     if (d.reqEdited) frag.appendChild(el('div', 'The request was edited in the intercept queue; the stored copy is what was actually sent.', 'banner edit'));
     if (d.respEdited) frag.appendChild(el('div', 'The response was edited in the intercept queue; the stored copy is what was delivered to the client.', 'banner edit'));
+    if (d.rulesApplied && d.rulesApplied.length) {
+      frag.appendChild(el('div', 'Modified by match & replace rule(s): ' + d.rulesApplied.join(', '), 'banner rule'));
+    }
     if (d.note) frag.appendChild(el('div', d.note, 'banner note'));
     if (d.error) frag.appendChild(el('div', d.error, 'error'));
 
@@ -93,7 +96,7 @@
   }
 
   // ---- tabs ----
-  const views = ['history', 'intercept', 'repeater'];
+  const views = ['history', 'intercept', 'repeater', 'rules'];
   function showView(name) {
     if (!views.includes(name)) name = 'history';
     for (const v of views) $('view-' + v).hidden = v !== name;

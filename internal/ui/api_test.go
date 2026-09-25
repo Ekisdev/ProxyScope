@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,7 @@ import (
 
 	"proxyscope/internal/intercept"
 	"proxyscope/internal/model"
+	"proxyscope/internal/rules"
 )
 
 func TestHeadersTextRoundTripAndValidation(t *testing.T) {
@@ -142,14 +145,21 @@ func (seedStore) Get(_ context.Context, id int64) (*model.Exchange, error) {
 		return nil, model.ErrNotFound
 	}
 	return &model.Exchange{ID: 7, Method: "POST", URL: "https://api.example/v1?x=1", Host: "api.example", Path: "/v1?x=1",
-		ReqHeaders: http.Header{"Content-Type": {"application/json"}}, ReqBody: []byte(`{"a":1}`), ReqBodySize: 7}, nil
+		ReqHeaders: http.Header{"Content-Type": {"application/json"}}, ReqBody: []byte(`{"a":1}`), ReqBodySize: 7,
+		RulesApplied: []string{"verify-bypass"}}, nil
 }
 
 func newAPI(t *testing.T) (http.Handler, *intercept.Manager, *fakeRepeater) {
+	h, m, rep, _ := newAPIWithRules(t)
+	return h, m, rep
+}
+
+func newAPIWithRules(t *testing.T) (http.Handler, *intercept.Manager, *fakeRepeater, *rules.Engine) {
 	m := intercept.New(10 * time.Second)
 	rep := &fakeRepeater{}
-	s := New("127.0.0.1:0", Deps{Store: seedStore{}, Interceptor: m, Repeater: rep}, slog.New(slog.DiscardHandler))
-	return s.server.Handler, m, rep
+	re := rules.New(filepath.Join(t.TempDir(), "rules.yaml"))
+	s := New("127.0.0.1:0", Deps{Store: seedStore{}, Interceptor: m, Repeater: rep, Rules: re}, slog.New(slog.DiscardHandler))
+	return s.server.Handler, m, rep, re
 }
 
 func call(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -298,3 +308,92 @@ func TestRepeaterAPI(t *testing.T) {
 }
 
 func itoa(i int64) string { b, _ := json.Marshal(i); return string(b) }
+
+func TestRulesAPIStructuredSaveAndList(t *testing.T) {
+	h, _, _, re := newAPIWithRules(t)
+
+	var st rulesState
+	json.Unmarshal(call(h, "GET", "/api/rules", "").Body.Bytes(), &st)
+	if len(st.Rules) != 0 || st.Path != re.Path() {
+		t.Fatalf("initial state = %+v", st)
+	}
+
+	save := `{"rules":[{"id":"r1","enabled":true,"direction":"request","action":{"type":"add_header","name":"X","value":"1"}}]}`
+	w := call(h, "PUT", "/api/rules", save)
+	if w.Code != 200 {
+		t.Fatalf("save = %d %s", w.Code, w.Body)
+	}
+	json.Unmarshal(w.Body.Bytes(), &st)
+	if len(st.Rules) != 1 || st.Rules[0].ID != "r1" || !strings.Contains(st.Raw, "r1") {
+		t.Fatalf("state after save = %+v", st)
+	}
+	// The engine's active rule set must reflect the save immediately (no
+	// separate reload needed for a UI-driven change).
+	if got := re.Rules(); len(got) != 1 || got[0].ID != "r1" {
+		t.Fatalf("engine rules = %+v", got)
+	}
+
+	// An invalid rule is rejected, and the previous (valid) rule set survives.
+	bad := `{"rules":[{"id":"","enabled":true,"direction":"request","action":{"type":"add_header","name":"X","value":"1"}}]}`
+	if w := call(h, "PUT", "/api/rules", bad); w.Code != 400 {
+		t.Fatalf("bad save = %d %s", w.Code, w.Body)
+	}
+	if got := re.Rules(); len(got) != 1 || got[0].ID != "r1" {
+		t.Fatalf("engine rules after failed save = %+v", got)
+	}
+}
+
+func TestRulesAPIRawSaveAndReload(t *testing.T) {
+	h, _, _, re := newAPIWithRules(t)
+
+	rawGood := `{"yaml":"version: 1\nrules:\n  - id: raw1\n    enabled: true\n    direction: response\n    action: {type: set_status, status: 201}\n"}`
+	w := call(h, "PUT", "/api/rules/raw", rawGood)
+	if w.Code != 200 {
+		t.Fatalf("raw save = %d %s", w.Code, w.Body)
+	}
+	var st rulesState
+	json.Unmarshal(w.Body.Bytes(), &st)
+	if len(st.Rules) != 1 || st.Rules[0].ID != "raw1" {
+		t.Fatalf("state = %+v", st)
+	}
+
+	rawBad := `{"yaml":"not: valid: yaml: ["}`
+	if w := call(h, "PUT", "/api/rules/raw", rawBad); w.Code != 400 {
+		t.Fatalf("bad raw save = %d %s", w.Code, w.Body)
+	}
+	if got := re.Rules(); len(got) != 1 || got[0].ID != "raw1" {
+		t.Fatalf("engine rules after failed raw save = %+v", got)
+	}
+
+	// A hand-edit on disk is picked up by /reload.
+	if err := os.WriteFile(re.Path(), []byte("version: 1\nrules: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w = call(h, "POST", "/api/rules/reload", "")
+	if w.Code != 200 {
+		t.Fatalf("reload = %d %s", w.Code, w.Body)
+	}
+	json.Unmarshal(w.Body.Bytes(), &st)
+	if len(st.Rules) != 0 {
+		t.Fatalf("state after reload = %+v", st)
+	}
+
+	// Reload of a now-broken file reports the error and keeps rules empty
+	// (it must not crash or silently keep stale rules from before the write).
+	if err := os.WriteFile(re.Path(), []byte("not: valid: yaml: ["), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if w := call(h, "POST", "/api/rules/reload", ""); w.Code != 400 {
+		t.Fatalf("bad reload = %d %s", w.Code, w.Body)
+	}
+}
+
+func TestRulesAppliedShowInHistoryDetail(t *testing.T) {
+	h, _, _, _ := newAPIWithRules(t)
+	w := call(h, "GET", "/api/exchanges/7", "")
+	var d detailView
+	json.Unmarshal(w.Body.Bytes(), &d)
+	if w.Code != 200 || len(d.RulesApplied) != 1 || d.RulesApplied[0] != "verify-bypass" {
+		t.Fatalf("detail = %d %+v", w.Code, d)
+	}
+}

@@ -48,10 +48,17 @@ type Exchange struct {
 	// intercept queue; the stored copy is what was actually sent/delivered.
 	ReqEdited  bool
 	RespEdited bool
+	// RulesApplied holds the ids of every match & replace rule that fired on
+	// this exchange (request-direction rules first, then response-direction,
+	// each in the file's evaluation order), or nil if none did.
+	RulesApplied []string
 	// Note is a non-error annotation, e.g. "auto-forwarded after 1m0s" or
 	// "response not intercepted: streaming response".
 	Note string
 }
+
+// RuleFired reports whether any match & replace rule modified this exchange.
+func (e *Exchange) RuleFired() bool { return len(e.RulesApplied) > 0 }
 
 // ReqBodyTruncated reports whether ReqBody holds fewer bytes than were sent.
 func (e *Exchange) ReqBodyTruncated() bool { return e.ReqBodySize > int64(len(e.ReqBody)) }
@@ -73,6 +80,7 @@ type Summary struct {
 	Error        string    `json:"error,omitempty"`
 	Source       string    `json:"source"`         // SourceProxy or SourceRepeater
 	Edited       bool      `json:"edited"`         // modified via intercept
+	RuleFired    bool      `json:"ruleFired"`      // modified by a match & replace rule
 	Note         string    `json:"note,omitempty"` // non-error annotation
 }
 

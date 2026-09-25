@@ -20,6 +20,7 @@ import (
 	"proxyscope/internal/outbound"
 	"proxyscope/internal/proxy"
 	"proxyscope/internal/repeater"
+	"proxyscope/internal/rules"
 	"proxyscope/internal/store"
 	"proxyscope/internal/ui"
 )
@@ -78,17 +79,24 @@ func run() error {
 		InsecureUpstream: cfg.InsecureUpstream,
 	}
 	icpt := intercept.New(cfg.InterceptTimeout)
+
+	re := rules.New(cfg.RulesFile)
+	if err := re.Load(); err != nil {
+		return fmt.Errorf("match & replace rules: %w", err)
+	}
+	log.Info("match & replace rules loaded", "path", re.Path(), "count", len(re.Rules()))
+
 	px := proxy.New(proxy.Config{
 		Addr:         cfg.ProxyAddr,
 		MaxBodyBytes: cfg.MaxBodyBytes,
 		Outbound:     out,
-	}, st, authority, icpt, log)
+	}, st, authority, icpt, re, log)
 	rep := repeater.New(repeater.Config{MaxBodyBytes: cfg.MaxBodyBytes, Outbound: out}, st)
 	defer rep.Close()
 	if cfg.InsecureUpstream {
 		log.Warn("upstream TLS certificate validation is DISABLED (-insecure-upstream)")
 	}
-	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, CAPEM: authority.CertPEM()}, log)
+	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, Rules: re, CAPEM: authority.CertPEM()}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

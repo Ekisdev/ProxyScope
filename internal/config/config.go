@@ -23,6 +23,8 @@ type Config struct {
 	CADir            string // directory holding the MITM root CA (ca.crt, ca.key)
 	ExportCA         string // if set: write the public CA certificate here and exit
 	InsecureUpstream bool   // skip validation of upstream TLS certificates
+
+	RulesFile string // match & replace rules file (YAML); missing = zero rules
 }
 
 // Default returns the default configuration. Both listeners bind to loopback
@@ -37,6 +39,7 @@ func Default() Config {
 		HeaderTimeout:    60 * time.Second,
 		InterceptTimeout: 60 * time.Second,
 		CADir:            defaultCADir(),
+		RulesFile:        defaultRulesFile(),
 	}
 }
 
@@ -49,6 +52,18 @@ func defaultCADir() string {
 		return ""
 	}
 	return filepath.Join(base, "ekisde.dev", "Proxy", "ca")
+}
+
+// defaultRulesFile returns <user config dir>/ekisde.dev/Proxy/rules.yaml,
+// alongside (but outside of) the CA directory: rules are meant to be
+// version-controlled and shared, unlike the CA's private key. Empty if the
+// config dir is unknown.
+func defaultRulesFile() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(base, "ekisde.dev", "Proxy", "rules.yaml")
 }
 
 // Parse builds a Config from command-line arguments (without the program
@@ -67,6 +82,7 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.StringVar(&cfg.CADir, "ca-dir", cfg.CADir, "directory of the MITM root CA (ca.crt + ca.key); generated on first run")
 	fs.StringVar(&cfg.ExportCA, "export-ca", "", "write the public CA certificate to this file (PEM) and exit")
 	fs.BoolVar(&cfg.InsecureUpstream, "insecure-upstream", false, "do NOT validate upstream servers' TLS certificates (invalid/expired/self-signed are accepted)")
+	fs.StringVar(&cfg.RulesFile, "rules-file", cfg.RulesFile, "match & replace rules file (YAML); missing file = no rules, malformed file = refuse to start")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -81,6 +97,9 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	}
 	if cfg.CADir == "" {
 		return cfg, fmt.Errorf("cannot determine the user config directory; pass -ca-dir")
+	}
+	if cfg.RulesFile == "" {
+		return cfg, fmt.Errorf("cannot determine the user config directory; pass -rules-file")
 	}
 	if cfg.ProxyAddr == cfg.UIAddr {
 		return cfg, fmt.Errorf("-proxy-addr and -ui-addr must differ")

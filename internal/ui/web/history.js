@@ -22,6 +22,7 @@
     const add = (txt, cls, title) => { const b = el('span', txt, 'flag ' + cls); b.title = title; td.appendChild(b); };
     if (s.source === 'repeater') add('R', 'flag-r', 'Replayed from the repeater');
     if (s.edited) add('E', 'flag-e', 'Edited in the intercept queue');
+    if (s.ruleFired) add('M', 'flag-m', 'Modified by a match & replace rule');
     if (s.note) add('N', 'flag-n', s.note);
     return td;
   }

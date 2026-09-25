@@ -48,11 +48,24 @@ type Repeater interface {
 	Send(ctx context.Context, req *model.Request) (*model.Exchange, error)
 }
 
+// Rules is the match & replace rules engine (implemented by rules.Engine).
+// Every write validates before touching the file or the active rule set: on
+// error nothing changes, so a bad edit never loses previously working rules.
+type Rules interface {
+	Path() string
+	Rules() []model.Rule
+	ReadRaw() (string, error)
+	SaveRules(rules []model.Rule) error
+	SaveRaw(yamlText string) error
+	Load() error // re-read the file from disk (manual reload after a hand-edit)
+}
+
 // Deps are the collaborators of the UI server.
 type Deps struct {
 	Store       Store
 	Interceptor Interceptor
 	Repeater    Repeater
+	Rules       Rules
 	CAPEM       []byte // public CA certificate served at /ca.crt (nil disables it)
 }
 
@@ -67,6 +80,7 @@ type Server struct {
 	store  Store
 	icpt   Interceptor
 	rep    Repeater
+	rules  Rules
 	caPEM  []byte // public CA certificate offered for download (never the key)
 	log    *slog.Logger
 	server *http.Server
@@ -74,7 +88,7 @@ type Server struct {
 
 // New creates the UI server. It does not start listening.
 func New(addr string, d Deps, log *slog.Logger) *Server {
-	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, caPEM: d.CAPEM, log: log}
+	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, rules: d.Rules, caPEM: d.CAPEM, log: log}
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err) // embedded path is fixed at compile time
@@ -92,6 +106,10 @@ func New(addr string, d Deps, log *slog.Logger) *Server {
 	mux.HandleFunc("GET /api/intercept/{id}", s.handleInterceptGet)
 	mux.HandleFunc("POST /api/intercept/{id}/forward", s.handleInterceptForward)
 	mux.HandleFunc("POST /api/intercept/{id}/drop", s.handleInterceptDrop)
+	mux.HandleFunc("GET /api/rules", s.handleRulesState)
+	mux.HandleFunc("PUT /api/rules", s.handleRulesSave)
+	mux.HandleFunc("PUT /api/rules/raw", s.handleRulesSaveRaw)
+	mux.HandleFunc("POST /api/rules/reload", s.handleRulesReload)
 	s.server = &http.Server{
 		Handler:           s.guard(mux),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -246,30 +264,32 @@ type responseView struct {
 }
 
 type detailView struct {
-	ID         int64         `json:"id"`
-	Source     string        `json:"source"`
-	ReqEdited  bool          `json:"reqEdited,omitempty"`
-	RespEdited bool          `json:"respEdited,omitempty"`
-	Note       string        `json:"note,omitempty"`
-	Timestamp  time.Time     `json:"timestamp"`
-	DurationMs float64       `json:"durationMs"`
-	URL        string        `json:"url"`
-	Error      string        `json:"error,omitempty"`
-	Request    requestView   `json:"request"`
-	Response   *responseView `json:"response,omitempty"`
+	ID           int64         `json:"id"`
+	Source       string        `json:"source"`
+	ReqEdited    bool          `json:"reqEdited,omitempty"`
+	RespEdited   bool          `json:"respEdited,omitempty"`
+	RulesApplied []string      `json:"rulesApplied,omitempty"`
+	Note         string        `json:"note,omitempty"`
+	Timestamp    time.Time     `json:"timestamp"`
+	DurationMs   float64       `json:"durationMs"`
+	URL          string        `json:"url"`
+	Error        string        `json:"error,omitempty"`
+	Request      requestView   `json:"request"`
+	Response     *responseView `json:"response,omitempty"`
 }
 
 func buildDetail(ex *model.Exchange) detailView {
 	d := detailView{
-		ID:         ex.ID,
-		Source:     sourceOf(ex),
-		ReqEdited:  ex.ReqEdited,
-		RespEdited: ex.RespEdited,
-		Note:       ex.Note,
-		Timestamp:  ex.Timestamp,
-		DurationMs: float64(ex.Duration) / float64(time.Millisecond),
-		URL:        ex.URL,
-		Error:      ex.Error,
+		ID:           ex.ID,
+		Source:       sourceOf(ex),
+		ReqEdited:    ex.ReqEdited,
+		RespEdited:   ex.RespEdited,
+		RulesApplied: ex.RulesApplied,
+		Note:         ex.Note,
+		Timestamp:    ex.Timestamp,
+		DurationMs:   float64(ex.Duration) / float64(time.Millisecond),
+		URL:          ex.URL,
+		Error:        ex.Error,
 		Request: requestView{
 			Method:  ex.Method,
 			Path:    ex.Path,
