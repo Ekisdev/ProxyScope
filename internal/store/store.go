@@ -20,7 +20,7 @@ import (
 
 // schemaVersion is stored in PRAGMA user_version. Bump it and add a migration
 // step in migrate() whenever the schema changes.
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS exchanges (
@@ -55,6 +55,38 @@ ALTER TABLE exchanges ADD COLUMN note        TEXT    NOT NULL DEFAULT '';`
 const schemaV3 = `
 ALTER TABLE exchanges ADD COLUMN rule_fired    INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE exchanges ADD COLUMN rules_applied TEXT    NOT NULL DEFAULT '[]';`
+
+// schemaV4 (Phase 5) adds the generic TCP/UDP relay's own tables, separate
+// from exchanges because the data shape is different (no method/URL/status,
+// just raw byte chunks grouped into sessions). relay_sessions is one TCP
+// connection or UDP client grouping; relay_chunks is every captured chunk,
+// ordered by seq (both directions share one sequence per session, for a
+// true chronological view). closed_at_ns is NULL while a session is open.
+const schemaV4 = `
+CREATE TABLE IF NOT EXISTS relay_sessions (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	target         TEXT    NOT NULL,
+	protocol       TEXT    NOT NULL,
+	client_addr    TEXT    NOT NULL,
+	upstream_addr  TEXT    NOT NULL,
+	opened_at_ns   INTEGER NOT NULL,
+	closed_at_ns   INTEGER,
+	bytes_up       INTEGER NOT NULL DEFAULT 0,
+	bytes_down     INTEGER NOT NULL DEFAULT 0,
+	error          TEXT    NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS relay_chunks (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	session_id     INTEGER NOT NULL REFERENCES relay_sessions(id),
+	seq            INTEGER NOT NULL,
+	direction      TEXT    NOT NULL,
+	ts_ns          INTEGER NOT NULL,
+	data           BLOB    NOT NULL,
+	data_size      INTEGER NOT NULL,
+	edited         INTEGER NOT NULL DEFAULT 0,
+	note           TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS relay_chunks_session_idx ON relay_chunks(session_id, seq);`
 
 // Store is a SQLite-backed exchange store. It is safe for concurrent use.
 type Store struct {
@@ -126,6 +158,22 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate to schema v3: %w", err)
 		}
 		if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration: %w", err)
+		}
+	}
+	if v < 4 {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(schemaV4); err != nil {
+			return fmt.Errorf("migrate to schema v4: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 4"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -267,4 +315,156 @@ func decodeHeaders(s string) (http.Header, error) {
 		return nil, err
 	}
 	return h, nil
+}
+
+// --- Relay (Phase 5) ---
+
+const (
+	defaultRelaySessionLimit = 200
+	maxRelaySessionLimit     = 1000
+	maxRelayChunkLimit       = 5000 // defensive cap: a long session can have many tiny chunks
+)
+
+// OpenSession inserts sess (which may already be closed, e.g. a dial
+// failure recorded in one step) and sets sess.ID. It satisfies relay.Sink.
+func (s *Store) OpenSession(ctx context.Context, sess *model.RelaySession) error {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO relay_sessions (target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		sess.Target, string(sess.Protocol), sess.ClientAddr, sess.UpstreamAddr, sess.OpenedAt.UnixNano(),
+		closedAtNs(sess.ClosedAt), sess.BytesUp, sess.BytesDown, sess.Error)
+	if err != nil {
+		return fmt.Errorf("insert relay session: %w", err)
+	}
+	sess.ID, err = res.LastInsertId()
+	return err
+}
+
+// CloseSession records a session as finished. It satisfies relay.Sink.
+func (s *Store) CloseSession(ctx context.Context, id int64, closedAt time.Time, bytesUp, bytesDown int64, errStr string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE relay_sessions SET closed_at_ns = ?, bytes_up = ?, bytes_down = ?, error = ? WHERE id = ?`,
+		closedAt.UnixNano(), bytesUp, bytesDown, errStr, id); err != nil {
+		return fmt.Errorf("close relay session %d: %w", id, err)
+	}
+	return nil
+}
+
+// SaveChunk inserts c and sets c.ID. It satisfies relay.Sink.
+func (s *Store) SaveChunk(ctx context.Context, c *model.RelayChunk) error {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO relay_chunks (session_id, seq, direction, ts_ns, data, data_size, edited, note)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		c.SessionID, c.Seq, string(c.Direction), c.Timestamp.UnixNano(), c.Data, c.DataSize, c.Edited, c.Note)
+	if err != nil {
+		return fmt.Errorf("insert relay chunk: %w", err)
+	}
+	c.ID, err = res.LastInsertId()
+	return err
+}
+
+// ListRelaySessions returns session summaries, newest first. target ""
+// means every target; limit is clamped like List's for exchanges.
+func (s *Store) ListRelaySessions(ctx context.Context, target string, limit int) ([]model.RelaySessionSummary, error) {
+	if limit <= 0 {
+		limit = defaultRelaySessionLimit
+	}
+	limit = min(limit, maxRelaySessionLimit)
+	const cols = `id, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if target != "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM relay_sessions WHERE target = ? ORDER BY id DESC LIMIT ?`, target, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM relay_sessions ORDER BY id DESC LIMIT ?`, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list relay sessions: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.RelaySessionSummary{}
+	for rows.Next() {
+		var (
+			m        model.RelaySessionSummary
+			protocol string
+			openedNs int64
+			closedNs sql.NullInt64
+		)
+		if err := rows.Scan(&m.ID, &m.Target, &protocol, &m.ClientAddr, &m.UpstreamAddr, &openedNs, &closedNs, &m.BytesUp, &m.BytesDown, &m.Error); err != nil {
+			return nil, fmt.Errorf("scan relay session: %w", err)
+		}
+		m.Protocol = protocol
+		m.OpenedAt = time.Unix(0, openedNs)
+		if closedNs.Valid {
+			c := time.Unix(0, closedNs.Int64)
+			m.ClosedAt = &c
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// GetRelaySession returns one session, or model.ErrNotFound.
+func (s *Store) GetRelaySession(ctx context.Context, id int64) (*model.RelaySession, error) {
+	var (
+		sess     model.RelaySession
+		protocol string
+		openedNs int64
+		closedNs sql.NullInt64
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error
+		 FROM relay_sessions WHERE id = ?`, id).
+		Scan(&sess.ID, &sess.Target, &protocol, &sess.ClientAddr, &sess.UpstreamAddr, &openedNs, &closedNs, &sess.BytesUp, &sess.BytesDown, &sess.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, model.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get relay session %d: %w", id, err)
+	}
+	sess.Protocol = model.RelayProtocol(protocol)
+	sess.OpenedAt = time.Unix(0, openedNs)
+	if closedNs.Valid {
+		sess.ClosedAt = time.Unix(0, closedNs.Int64)
+	}
+	return &sess, nil
+}
+
+// ListRelayChunks returns every captured chunk for sessionID, in capture
+// order, up to a defensive limit (a long session can produce many tiny
+// chunks; there is no pagination API for this yet).
+func (s *Store) ListRelayChunks(ctx context.Context, sessionID int64) ([]model.RelayChunk, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, session_id, seq, direction, ts_ns, data, data_size, edited, note
+		 FROM relay_chunks WHERE session_id = ? ORDER BY seq ASC LIMIT ?`, sessionID, maxRelayChunkLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list relay chunks: %w", err)
+	}
+	defer rows.Close()
+
+	out := []model.RelayChunk{}
+	for rows.Next() {
+		var (
+			c         model.RelayChunk
+			direction string
+			tsNs      int64
+		)
+		if err := rows.Scan(&c.ID, &c.SessionID, &c.Seq, &direction, &tsNs, &c.Data, &c.DataSize, &c.Edited, &c.Note); err != nil {
+			return nil, fmt.Errorf("scan relay chunk: %w", err)
+		}
+		c.Direction = model.RelayDirection(direction)
+		c.Timestamp = time.Unix(0, tsNs)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func closedAtNs(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UnixNano()
 }

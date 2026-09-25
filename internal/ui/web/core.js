@@ -96,7 +96,7 @@
   }
 
   // ---- tabs ----
-  const views = ['history', 'intercept', 'repeater', 'rules'];
+  const views = ['history', 'intercept', 'repeater', 'rules', 'relay'];
   function showView(name) {
     if (!views.includes(name)) name = 'history';
     for (const v of views) $('view-' + v).hidden = v !== name;

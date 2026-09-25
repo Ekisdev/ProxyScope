@@ -30,6 +30,11 @@ type Store interface {
 	List(ctx context.Context, afterID int64, limit int) ([]model.Summary, error)
 	Get(ctx context.Context, id int64) (*model.Exchange, error)
 	Clear(ctx context.Context) error
+
+	// Relay (Phase 5) session/chunk reads. target "" means every target.
+	ListRelaySessions(ctx context.Context, target string, limit int) ([]model.RelaySessionSummary, error)
+	GetRelaySession(ctx context.Context, id int64) (*model.RelaySession, error)
+	ListRelayChunks(ctx context.Context, sessionID int64) ([]model.RelayChunk, error)
 }
 
 // Interceptor is the live-intercept queue (implemented by intercept.Manager).
@@ -60,12 +65,27 @@ type Rules interface {
 	Load() error // re-read the file from disk (manual reload after a hand-edit)
 }
 
+// RelayStatus is the generic TCP/UDP relay's configured targets and live
+// hold queue (implemented by relay.Service). Session/chunk history is read
+// through Store instead, exactly like intercept's held items vs. exchange
+// history are two different things (live vs. recorded).
+type RelayStatus interface {
+	Targets() []model.RelayTarget
+	Timeout() time.Duration // shared auto-forward timeout for every target's held chunks
+	Settings(target string) model.RelaySettings
+	SetSettings(target string, s model.RelaySettings)
+	List() []model.RelayPendingSummary
+	Get(id int64) (*model.RelayPending, error)
+	Resolve(id int64, res model.RelayResolution) error
+}
+
 // Deps are the collaborators of the UI server.
 type Deps struct {
 	Store       Store
 	Interceptor Interceptor
 	Repeater    Repeater
 	Rules       Rules
+	Relay       RelayStatus
 	CAPEM       []byte // public CA certificate served at /ca.crt (nil disables it)
 }
 
@@ -81,6 +101,7 @@ type Server struct {
 	icpt   Interceptor
 	rep    Repeater
 	rules  Rules
+	relay  RelayStatus
 	caPEM  []byte // public CA certificate offered for download (never the key)
 	log    *slog.Logger
 	server *http.Server
@@ -88,7 +109,7 @@ type Server struct {
 
 // New creates the UI server. It does not start listening.
 func New(addr string, d Deps, log *slog.Logger) *Server {
-	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, rules: d.Rules, caPEM: d.CAPEM, log: log}
+	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, rules: d.Rules, relay: d.Relay, caPEM: d.CAPEM, log: log}
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err) // embedded path is fixed at compile time
@@ -110,6 +131,13 @@ func New(addr string, d Deps, log *slog.Logger) *Server {
 	mux.HandleFunc("PUT /api/rules", s.handleRulesSave)
 	mux.HandleFunc("PUT /api/rules/raw", s.handleRulesSaveRaw)
 	mux.HandleFunc("POST /api/rules/reload", s.handleRulesReload)
+	mux.HandleFunc("GET /api/relay", s.handleRelayState)
+	mux.HandleFunc("PUT /api/relay/targets/{name}/settings", s.handleRelaySettings)
+	mux.HandleFunc("GET /api/relay/sessions", s.handleRelaySessions)
+	mux.HandleFunc("GET /api/relay/sessions/{id}", s.handleRelaySessionDetail)
+	mux.HandleFunc("GET /api/relay/pending/{id}", s.handleRelayPendingGet)
+	mux.HandleFunc("POST /api/relay/pending/{id}/forward", s.handleRelayForward)
+	mux.HandleFunc("POST /api/relay/pending/{id}/drop", s.handleRelayDrop)
 	s.server = &http.Server{
 		Handler:           s.guard(mux),
 		ReadHeaderTimeout: 10 * time.Second,

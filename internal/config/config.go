@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -25,6 +27,19 @@ type Config struct {
 	InsecureUpstream bool   // skip validation of upstream TLS certificates
 
 	RulesFile string // match & replace rules file (YAML); missing = zero rules
+
+	RelayTargets        []RelayTarget // generic TCP/UDP relays; empty = the relay engine does nothing
+	RelayMaxCapture     int64         // max bytes stored per relay session per direction (still fully forwarded)
+	RelayUDPIdleTimeout time.Duration // evict a UDP relay session after this much inactivity
+}
+
+// RelayTarget is one configured TCP/UDP relay: listen locally, forward to
+// upstream. Protocol is "tcp" or "udp".
+type RelayTarget struct {
+	Name     string
+	Protocol string
+	Listen   string
+	Upstream string
 }
 
 // Default returns the default configuration. Both listeners bind to loopback
@@ -40,6 +55,9 @@ func Default() Config {
 		InterceptTimeout: 60 * time.Second,
 		CADir:            defaultCADir(),
 		RulesFile:        defaultRulesFile(),
+
+		RelayMaxCapture:     10 << 20,
+		RelayUDPIdleTimeout: 2 * time.Minute,
 	}
 }
 
@@ -66,6 +84,72 @@ func defaultRulesFile() string {
 	return filepath.Join(base, "ekisde.dev", "Proxy", "rules.yaml")
 }
 
+// relayTargetsFlag implements flag.Value so -relay can be given multiple
+// times, once per target: -relay "name=game1,proto=tcp,listen=127.0.0.1:9100,upstream=game.example.com:9100".
+// A comma-separated key=value format is used (rather than a positional
+// colon-delimited one) because host:port values already contain colons.
+type relayTargetsFlag struct{ targets *[]RelayTarget }
+
+func (f relayTargetsFlag) String() string {
+	if f.targets == nil {
+		return ""
+	}
+	names := make([]string, len(*f.targets))
+	for i, t := range *f.targets {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ",")
+}
+
+func (f relayTargetsFlag) Set(s string) error {
+	t, err := parseRelayTarget(s)
+	if err != nil {
+		return err
+	}
+	*f.targets = append(*f.targets, t)
+	return nil
+}
+
+func parseRelayTarget(s string) (RelayTarget, error) {
+	var t RelayTarget
+	for _, field := range strings.Split(s, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(field, "=")
+		if !ok {
+			return t, fmt.Errorf("-relay: invalid field %q (want key=value)", field)
+		}
+		v = strings.TrimSpace(v)
+		switch strings.TrimSpace(k) {
+		case "name":
+			t.Name = v
+		case "proto", "protocol":
+			t.Protocol = strings.ToLower(v)
+		case "listen":
+			t.Listen = v
+		case "upstream":
+			t.Upstream = v
+		default:
+			return t, fmt.Errorf("-relay: unknown field %q", k)
+		}
+	}
+	if t.Name == "" {
+		return t, fmt.Errorf("-relay: name is required")
+	}
+	if t.Protocol != "tcp" && t.Protocol != "udp" {
+		return t, fmt.Errorf("-relay %q: proto must be \"tcp\" or \"udp\", got %q", t.Name, t.Protocol)
+	}
+	if _, _, err := net.SplitHostPort(t.Listen); err != nil {
+		return t, fmt.Errorf("-relay %q: invalid listen address %q: %w", t.Name, t.Listen, err)
+	}
+	if _, _, err := net.SplitHostPort(t.Upstream); err != nil {
+		return t, fmt.Errorf("-relay %q: invalid upstream address %q: %w", t.Name, t.Upstream, err)
+	}
+	return t, nil
+}
+
 // Parse builds a Config from command-line arguments (without the program
 // name). It returns flag.ErrHelp when -h was requested.
 func Parse(args []string, out io.Writer) (Config, error) {
@@ -83,6 +167,9 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.StringVar(&cfg.ExportCA, "export-ca", "", "write the public CA certificate to this file (PEM) and exit")
 	fs.BoolVar(&cfg.InsecureUpstream, "insecure-upstream", false, "do NOT validate upstream servers' TLS certificates (invalid/expired/self-signed are accepted)")
 	fs.StringVar(&cfg.RulesFile, "rules-file", cfg.RulesFile, "match & replace rules file (YAML); missing file = no rules, malformed file = refuse to start")
+	fs.Var(relayTargetsFlag{&cfg.RelayTargets}, "relay", `generic TCP/UDP relay target, repeatable: "name=game1,proto=tcp,listen=127.0.0.1:9100,upstream=game.example.com:9100"`)
+	fs.Int64Var(&cfg.RelayMaxCapture, "relay-max-capture", cfg.RelayMaxCapture, "max bytes stored per relay session per direction (still fully forwarded in full)")
+	fs.DurationVar(&cfg.RelayUDPIdleTimeout, "relay-udp-idle-timeout", cfg.RelayUDPIdleTimeout, "evict a UDP relay session after this much inactivity (UDP has no close signal)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -103,6 +190,19 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	}
 	if cfg.ProxyAddr == cfg.UIAddr {
 		return cfg, fmt.Errorf("-proxy-addr and -ui-addr must differ")
+	}
+	if cfg.RelayMaxCapture < 0 {
+		return cfg, fmt.Errorf("-relay-max-capture must be >= 0")
+	}
+	if cfg.RelayUDPIdleTimeout <= 0 {
+		return cfg, fmt.Errorf("-relay-udp-idle-timeout must be > 0 (UDP sessions have no other way to end)")
+	}
+	seenRelay := map[string]bool{}
+	for _, t := range cfg.RelayTargets {
+		if seenRelay[t.Name] {
+			return cfg, fmt.Errorf("-relay: duplicate target name %q", t.Name)
+		}
+		seenRelay[t.Name] = true
 	}
 	return cfg, nil
 }

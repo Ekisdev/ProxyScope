@@ -56,11 +56,19 @@ func renderBody(h http.Header, body []byte, size int64) bodyView {
 		return v
 	}
 	v.Encoding = "hex"
-	if len(data) > maxHexView {
-		data, v.Clipped = data[:maxHexView], true
-	}
-	v.Content = hex.Dump(data)
+	v.Content, v.Clipped = hexView(data)
 	return v
+}
+
+// hexView renders data as a hex dump (offset/hex/ASCII), capped at
+// maxHexView bytes for display. Shared by renderBody (binary HTTP bodies)
+// and the relay chunk view (internal/ui/relay.go), which is always raw
+// bytes with no text/binary detection to do.
+func hexView(data []byte) (content string, clipped bool) {
+	if len(data) > maxHexView {
+		data, clipped = data[:maxHexView], true
+	}
+	return hex.Dump(data), clipped
 }
 
 // decode undoes a single Content-Encoding. A partially readable (truncated)

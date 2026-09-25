@@ -112,6 +112,11 @@ pre.head b { color: var(--accent); font-weight: 600; }
 #rules-list th:nth-child(3), #rules-list td:nth-child(3) { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #rules-list h2, #rules-editor h2 { margin: 14px 0 6px; }
 
+.relay-targets { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.relay-target { display: flex; align-items: center; white-space: nowrap; }
+#relay-list h2 { margin: 14px 0 6px; }
+#relay-list h2:first-child { margin-top: 0; }
+
 .rep-tab { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #1f242c; cursor: pointer; }
 .rep-tab:hover { background: #1d232c; }
 .rep-tab.sel { background: var(--sel); }

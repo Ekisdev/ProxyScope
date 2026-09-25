@@ -13,8 +13,10 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 | 1 | Plain HTTP proxy, SQLite history, web UI | **Implemented** |
 | 2 | HTTPS via TLS MITM with a custom local CA | **Implemented** |
 | 3 | Live intercept (pause/edit/forward/drop) + Repeater | **Implemented** |
-| 4 | Match & replace rules | **Implemented (this version)** |
-| 5 | Generic TCP/UDP relay (separate module) | Not started |
+| 4 | Match & replace rules | **Implemented** |
+| 5 | Generic TCP/UDP relay (separate module) | **Implemented (this version)** |
+| 5.1 | Byte-level match & replace rules for the relay | Not started (needs real usage experience first, see [Roadmap](#roadmap-not-implemented)) |
+| 6 | System-wide capture (WinDivert/NFQUEUE) | Not started |
 
 ### What works now
 
@@ -25,7 +27,8 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 - **Live intercept** (default off): hold every request after it is fully received and before it goes upstream, and/or hold every response before it goes to the client. Inspect and edit method, URL, headers, body (or status, headers, body for responses), then **Forward**, **Forward edited** or **Drop**. Works identically for HTTP and decrypted HTTPS, and many requests can be held at once. See [Live intercept](#live-intercept).
 - **Repeater**: "Send to Repeater" on any history row opens an editable copy that you can tweak and re-send as often as you like; each result is stored in history marked as *replayed*. See [Repeater](#repeater).
 - **Match & replace rules** (default: none configured): structured, declarative rules loaded from a YAML file automatically rewrite matching requests/responses (headers, body, status code) with no manual intervention, independently of whether live intercept is on. This is what makes automated, scripted traffic tampering possible (e.g. spoofing a license-check response for reverse engineering) without touching the target binary. See [Match & replace rules](#match--replace-rules).
-- Web UI: four tabs (History, Intercept, Repeater, Rules); history table with click-for-detail, near-real-time updates by polling, client-side filter, "hide replayed", pause, clear history, CA download link.
+- **Generic TCP/UDP relay** (default: no targets configured): a second, independent capability alongside the HTTP proxy for raw binary protocols (crackmes, games, anything that doesn't speak HTTP). Configure one or more `-relay` targets, and every byte in both directions is captured to SQLite and can optionally be paused and hand-edited as hex before it's forwarded — the byte-level analog of Live intercept. See [Generic TCP/UDP relay](#generic-tcpudp-relay).
+- Web UI: five tabs (History, Intercept, Repeater, Rules, Relay); history table with click-for-detail, near-real-time updates by polling, client-side filter, "hide replayed", pause, clear history, CA download link.
 - The UI decodes `gzip`/`deflate` response bodies for display and shows binary bodies as a hex dump. The stored body is always the raw bytes from the wire.
 - Network and TLS errors never crash the proxy. Unreachable host, DNS failure, refused connection, timeouts and invalid upstream certificates are logged, stored, and returned to the client as a readable plain-text `502`/`504` (also inside TLS tunnels). A client that refuses the ProxyScope certificate produces a `CONNECT` row with an explanatory error and a log warning; nothing hangs.
 
@@ -42,12 +45,14 @@ You point your browser (or any HTTP client) at proxyscope as a manual HTTP proxy
 - No proxy authentication, no upstream proxy chaining, no client-certificate (mTLS) forwarding.
 - Intercept: bodies larger than `-max-body` and streaming responses (`text/event-stream`) are **not held**; they flow through untouched and the history row gets a note. Binary bodies can be held and forwarded/dropped and their headers edited, but not edited as text. Held bodies are buffered in memory (up to `-max-body` each). The intercept toggles and held items are in memory only: they reset when ProxyScope restarts. Scope/filter rules ("intercept only matching requests") do not exist yet; intercept applies to all requests. See [Live intercept](#live-intercept) and [Repeater](#repeater) for more details.
 - Rules: like intercept, a rule whose condition or action touches the body **never fires** on a body larger than `-max-body` or a streaming (`text/event-stream`) response — it cannot see or usefully rewrite what it never buffered, so the message flows through untouched and the history row gets a note; header/status-only rules are unaffected by this limit. A rule cannot decompress a `gzip`/`deflate` body to match/replace its logical content: matching/replacement always operates on the raw wire bytes, so a compressed body needs a companion request-direction rule that strips/rewrites `Accept-Encoding` so the upstream sends it uncompressed in the first place (see the example below). Each rule has exactly one action (chain several rules for multiple effects). Conditions are AND-only; there is no OR/grouping yet. `scope.host` matches the hostname only (no port); `scope.path` matches the URL path only (no query string). Rules **do not run on Repeater sends** (the repeater bypasses the proxy listener and the intercept queue by design, and now the rule engine too). Reordering rules is done by editing the YAML array order (by hand, or via "Edit as raw YAML" in the UI); there is no drag-to-reorder list.
+- Relay: requires **explicit target configuration** — the client app must be pointed at the relay's listen address yourself (hosts file, app config, ...); there is no system-wide/transparent capture (that's Phase 6). There is **no byte-level match & replace for the relay yet** (Phase 5.1) — only manual hold/edit/drop; automating a relay rewrite today means resolving each held chunk by hand. A "chunk" is whatever one `Read()` off the wire returned (up to 32 KiB) — raw TCP/UDP has no message framing, so unlike an HTTP body there is no larger unit to hold at once. Captured bytes per session per direction are capped at `-relay-max-capture` (default 10 MiB, same spirit as `-max-body`): the full stream is always forwarded regardless, but chunks stop being stored once the cap is hit (one final row records the real size and says so). A held relay chunk releases on your action, `-intercept-timeout` (shared with HTTP intercept), or process shutdown — **not** on the specific connection disconnecting mid-hold, unlike HTTP intercept: raw TCP/UDP has no equivalent of the per-request context net/http hands the HTTP path for free, and building an equivalent watcher per held chunk wasn't worth the complexity (see `CLAUDE.md`). A UDP "session" is a client source address+port grouping with an inactivity timeout (`-relay-udp-idle-timeout`, default 2 minutes) — UDP has no close signal, so this is the only way a UDP session ever ends short of shutdown.
 
 ## Requirements
 
 - Go **1.25 or newer** (`go version`).
 - SQLite is provided by [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite), a pure-Go driver, so **no CGO / C compiler is needed** on either OS. TLS and certificates use Go's standard library.
 - The match & replace rules file is parsed with [`gopkg.in/yaml.v3`](https://pkg.go.dev/gopkg.in/yaml.v3) (pure Go, no CGO) — the standard library has no YAML support.
+- The generic TCP/UDP relay adds no new dependency: it is built entirely on the standard library `net` package.
 
 ## Install and run
 
@@ -89,8 +94,11 @@ Command-line flags (run `proxyscope -h` for the list):
 | `-export-ca` | *(unset)* | Write the public CA certificate (PEM) to this path and exit |
 | `-insecure-upstream` | `false` | **Do not validate upstream servers' TLS certificates** |
 | `-rules-file` | see [Match & replace rules](#match--replace-rules) | Match & replace rules file (YAML); a missing file means no rules, a malformed one refuses to start |
+| `-relay` | *(none, repeatable)* | A generic TCP/UDP relay target: `"name=game1,proto=tcp,listen=127.0.0.1:9100,upstream=game.example.com:9100"`. Give it once per target. See [Generic TCP/UDP relay](#generic-tcpudp-relay). |
+| `-relay-max-capture` | `10485760` | Max bytes **stored** per relay session per direction (the full stream is always forwarded in full regardless) |
+| `-relay-udp-idle-timeout` | `2m0s` | Evict a UDP relay session after this much inactivity (UDP has no close signal) |
 
-Both listeners bind to **loopback only** by default, because captured traffic contains credentials and cookies. Binding to `0.0.0.0` (e.g. to proxy a phone on your LAN) is possible via the flags but exposes an unauthenticated proxy and UI to your network. Do that only on networks you trust.
+Both listeners bind to **loopback only** by default, because captured traffic contains credentials and cookies. Binding to `0.0.0.0` (e.g. to proxy a phone on your LAN) is possible via the flags but exposes an unauthenticated proxy and UI to your network. Do that only on networks you trust. The same principle applies to `-relay` targets: a target's `listen` address should stay loopback unless you deliberately want another device on your network to reach it, and ProxyScope logs a startup warning if you configure one that doesn't (captured traffic — potentially credentials or a game/protocol's secrets — would then be reachable from your network, and the relay itself would accept connections from anyone who can reach that address).
 
 ## HTTPS interception
 
@@ -204,7 +212,7 @@ curl --cacert ~/.config/ekisde.dev/Proxy/ca/ca.crt -x http://127.0.0.1:8080 http
    - **Brave/Chrome/Edge**: they use the OS proxy settings (Windows: Settings → Network → Proxy; Linux: system proxy settings or `--proxy-server="127.0.0.1:8080"`). They bypass the proxy for localhost by default. Brave's Tor private windows use Tor instead and do not go through your proxy.
    - **curl**: `curl -x http://127.0.0.1:8080 http://example.com/` (add `--cacert` for HTTPS as above).
 3. Install the CA (previous section) for HTTPS.
-4. Open `http://127.0.0.1:8081` and browse. To pause and edit traffic, use the **Intercept** tab; to replay a request, use **Send to Repeater** on a history row; to have traffic rewritten automatically, use the **Rules** tab (all below).
+4. Open `http://127.0.0.1:8081` and browse. To pause and edit traffic, use the **Intercept** tab; to replay a request, use **Send to Repeater** on a history row; to have traffic rewritten automatically, use the **Rules** tab; for a non-HTTP (raw TCP/UDP) target, configure a `-relay` and use the **Relay** tab instead (all below).
 
 ## Live intercept
 
@@ -372,6 +380,62 @@ Lists every rule (enabled toggle, direction, scope/condition/action summary); cl
 
 When a rule fires on live traffic, the affected history row gets an **M** flag (next to R for replayed and E for edited) and the detail view shows a banner naming which rule(s) fired, in firing order — so after the fact it's obvious which traffic was auto-modified and by what.
 
+## Generic TCP/UDP relay
+
+A second, independent capability alongside the HTTP proxy: a plain byte-forwarder for protocols that don't speak HTTP at all — the core use case is a crackme or game with a custom binary protocol talking to a verification/license/game server, where you need to see and hand-edit raw bytes in transit. The relay is **not** built on top of `internal/proxy`; it shares no code path with the HTTP forwarder (only the SQLite store and the general shape of the intercept mechanism are shared, deliberately — see `CLAUDE.md`).
+
+It requires **explicit target configuration**: point the client app at the relay's listen address yourself (hosts file, app config, a `-jar`'s own `--server` flag, whatever the app uses), the same way you point a browser at the HTTP proxy. There is no system-wide/transparent capture — that is a distinct future phase (Phase 6, WinDivert on Windows / NFQUEUE on Linux).
+
+### Configuring a target
+
+Each target is one `-relay` flag, repeatable for multiple simultaneous targets (e.g. two different games on two different ports):
+
+```bash
+proxyscope \
+  -relay "name=game1,proto=tcp,listen=127.0.0.1:9100,upstream=game.example.com:9100" \
+  -relay "name=game2,proto=udp,listen=127.0.0.1:9200,upstream=game.example.com:9200"
+```
+
+Fields (comma-separated `key=value`, in any order):
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Unique label for this target (shown in the UI, used in the history and API) |
+| `proto` | `tcp` or `udp` |
+| `listen` | Local `host:port` the relay accepts connections/datagrams on |
+| `upstream` | The real server's `host:port` |
+
+Target names must be unique (`-relay` is rejected at startup otherwise). There is no UI for adding/editing targets in this phase — they are flag-only config, restart to change them (unlike rules, a target has only four fields and isn't meant to be hand-edited live; the UI shows their live status/traffic, not their definition).
+
+### Sessions: what a "session" means
+
+Every captured chunk belongs to a **session**, the relay's unit of history (shown as its own row in the UI, like an HTTP exchange):
+
+- **TCP**: a session is one accepted TCP connection, from accept to either side closing. Its `client_addr` is the client's real `ip:port`.
+- **UDP**: UDP is connectionless, so a session is defined as *every datagram sharing one client source address+port*, for one target. The first datagram from a new source opens a session and dials a dedicated upstream UDP socket for that client (the standard NAT-style 1:1 mapping, needed so return datagrams route back to the right client). Because UDP has no FIN/RST, a session only ends when it goes idle for `-relay-udp-idle-timeout` (default 2 minutes) — a background sweep (every few seconds, scaled to the timeout) evicts and closes idle sessions. There is no other way a UDP session ends short of ProxyScope shutting down.
+
+Within a session, every captured chunk gets a sequence number (`seq`); both directions share **one** sequence per session, so the stored history is a true chronological interleaving of what went out and what came back — not two separate per-direction logs.
+
+### Capture and storage
+
+Every chunk — a single `Read()` off the wire, up to 32 KiB, since raw TCP/UDP has no message framing to group multiple reads into one unit the way HTTP's Content-Length does — is captured to SQLite: session id, sequence number, direction (`up` = client→server, `down` = server→client), timestamp, and the bytes. The full stream is **always forwarded in full**, exactly like an HTTP body over `-max-body`; what can be limited is how much gets *stored*: `-relay-max-capture` (default 10 MiB) caps stored bytes per session per direction. Once a session/direction hits that cap, one final chunk row records the real size with a note explaining it, and no further chunk rows are stored for that direction (keeping a long-lived session's row count bounded) — but bytes keep flowing on the wire the whole time.
+
+### Manual intercept for raw bytes
+
+The byte-level analog of [Live intercept](#live-intercept): each target has two independent toggles, **up** and **down** (client→server / server→client), off by default. When on, a chunk about to be forwarded in that direction is held; open it in the **Relay** tab and **Forward**, **Forward edited** (paste/type hex — spaces and newlines are ignored, decoded with `encoding/hex`), or **Drop**.
+
+The concurrency mechanism deliberately mirrors `internal/intercept`'s (no worker goroutine, ownership-by-removal-under-a-mutex, a size-1 buffered channel per held item) rather than reusing `intercept.Manager` itself — a raw byte chunk has no method/URL/status the way `model.Request`/`model.Response` do, so reusing `Manager`'s HTTP-typed API would mean either Go-generics-ifying a stable, tested type or stuffing bytes into meaningless placeholder fields. See `CLAUDE.md` for the reasoning and the one real behavioral difference from HTTP intercept: a held relay chunk does **not** release when its specific connection disconnects mid-hold (only on your action, `-intercept-timeout`, or process shutdown) — raw TCP/UDP has no equivalent of the per-request context net/http hands the HTTP path for free, and a per-held-chunk watcher goroutine to detect it wasn't judged worth the complexity for this phase. In practice `-intercept-timeout` (shared with HTTP intercept, default 60s) is the backstop either way.
+
+Every hold still provably ends the same way HTTP intercept's does: user action, `-intercept-timeout`, or shutdown (which releases every held chunk, forwarded unmodified, via the same mechanism intercept uses — see `CLAUDE.md`).
+
+### The Relay tab
+
+- **Target toolbar**: every configured target, its protocol/listen/upstream, and its two intercept checkboxes.
+- **Held chunks**: currently-paused chunks across every target, with an auto-forward countdown; click one to hex-edit/forward/drop it.
+- **Sessions**: history of TCP connections and UDP client groupings (open or closed, byte counts, client/upstream addresses); click one for its full chronological chunk history, each chunk shown as an offset/hex/ASCII dump (`hex.Dump`, the same rendering — and the same underlying helper — used for binary HTTP bodies elsewhere in the UI) with direction, size and an "edited"/"TRUNCATED" flag where relevant.
+
+Security note: exactly like the HTTP proxy and UI, a relay target's `listen` address should stay on loopback unless you deliberately want it reachable from elsewhere on your network (see [Configuration](#configuration) above) — captured traffic can contain credentials or a game/protocol's own secrets, and a non-loopback listener accepts connections from anyone who can reach it.
+
 ## Troubleshooting
 
 ### Requests are missing, or responses look different, in Brave (Shields)
@@ -389,36 +453,44 @@ The same logic applies to other browsers' built-in blockers and to extensions (a
 ## Architecture
 
 ```
-cmd/proxyscope/        main: parse flags, load/create the CA, load rules, wire packages, run both servers, graceful shutdown
+cmd/proxyscope/        main: parse flags, load/create the CA, load rules, wire packages, run all servers, graceful shutdown
 internal/
   model/               Shared types (Exchange, Summary, intercept Request/Response/Outcome/Pending,
-                       match & replace Rule/Scope/Condition/Action...); no internal deps
-  config/              Flag parsing into a Config struct (incl. default CA directory, default rules file)
+                       match & replace Rule/Scope/Condition/Action, relay Chunk/RelaySession/RelayTarget/...); no internal deps
+  config/              Flag parsing into a Config struct (incl. default CA directory, default rules file, -relay targets)
   ca/                  Root CA generation/loading, leaf certificate issuing + cache, name validation, cert export
   outbound/            Talking to upstream servers, shared by proxy and repeater: transports, timeouts,
                        upstream TLS validation, request building, hop-by-hop stripping, body capture, error classification
   intercept/           Live intercept queue (Manager): pause points, held items, timeout, resolve/drop
   rules/               Match & replace engine (Engine): YAML load/validate/compile, scope + condition
                        matching, action application, atomic reload; see "Match & replace rules" above
-  proxy/               Proxy engine
+  proxy/               HTTP(S) proxy engine
     proxy.go             http.Handler, forward() (used by HTTP and HTTPS; hosts both pause points:
                          rules always run first, then intercept if enabled)
     tunnel.go            CONNECT handling: hijack, TLS handshake with the client (SNI), per-tunnel HTTP server
     headers.go           Upgrade detection
+  relay/               Generic TCP/UDP byte relay (Phase 5), independent of proxy/ — see "Generic TCP/UDP relay" above
+    relay.go             Service: per-target listeners, shutdown, storeChunk (capture cap)
+    tcp.go               Accept loop, per-connection bidirectional pump
+    udp.go                Per-target datagram loop, per-client-addr session map, idle sweep
+    hold.go               holdQueue: the relay's own pause/resume mechanism (same pattern as intercept.Manager,
+                          not the same type — see CLAUDE.md)
   repeater/            Direct re-send of an edited request; stores the result as "replayed"; no rules, no intercept
-  store/               SQLite persistence (Save/List/Get/Clear), schema versioning
+  store/               SQLite persistence (Save/List/Get/Clear, relay session/chunk equivalents), schema versioning
   ui/                  Web UI server + JSON API
     ui.go                routes, host/CSRF guard, CA download, history detail view
     intercept.go         /api/intercept handlers (state, settings, item detail, forward/drop)
     repeater.go          repeater seed + send handlers
     rules.go             /api/rules handlers (structured save, raw YAML save, reload)
+    relay.go             /api/relay handlers (target status, per-target settings, held-chunk hex edit forms,
+                         session list/detail)
     edit.go              edit forms <-> model types: header text, body edit rules, validation
-    body.go              body rendering for the browser (gzip/deflate decode, hex dump)
+    body.go              body rendering for the browser (gzip/deflate decode, hex dump; hexView is shared with relay.go)
     web/                 embedded static frontend: index.html, style.css,
-                         core.js (helpers, tabs, detail renderer), history.js, intercept.js, repeater.js, rules.js
+                         core.js (helpers, tabs, detail renderer), history.js, intercept.js, repeater.js, rules.js, relay.js
 ```
 
-Dependency direction: `cmd` → everything; `proxy`, `ui` and `repeater` depend on `model`, `outbound` (proxy, repeater) and on small interfaces they define themselves (`proxy.Sink`, `proxy.CertIssuer`, `proxy.Interceptor`, `proxy.RuleEngine`, `ui.Store`, `ui.Interceptor`, `ui.Repeater`, `ui.Rules`) that `store.Store`, `ca.Authority`, `intercept.Manager`, `repeater.Service` and `rules.Engine` satisfy. `store`, `ca`, `outbound`, `intercept` and `rules` are leaves (they depend at most on `model`). Nothing depends on `cmd`. All private-key handling is confined to the `ca` package. `proxy` and `repeater` never import each other, and the repeater never touches the proxy, the intercept queue, or the rule engine. The match & replace rule types (`Rule`, `Scope`, `Condition`, `Action`, ...) live in `model`, not in `rules`, so `ui` and `proxy` never need to import `internal/rules` directly — the same reason `Request`/`Response`/`Outcome` live in `model` for intercept.
+Dependency direction: `cmd` → everything; `proxy`, `ui` and `repeater` depend on `model`, `outbound` (proxy, repeater) and on small interfaces they define themselves (`proxy.Sink`, `proxy.CertIssuer`, `proxy.Interceptor`, `proxy.RuleEngine`, `ui.Store`, `ui.Interceptor`, `ui.Repeater`, `ui.Rules`, `ui.RelayStatus`) that `store.Store`, `ca.Authority`, `intercept.Manager`, `repeater.Service`, `rules.Engine` and `relay.Service` satisfy. `store`, `ca`, `outbound`, `intercept`, `rules` and `relay` are leaves (they depend at most on `model`). Nothing depends on `cmd`. All private-key handling is confined to the `ca` package. `proxy`, `repeater` and `relay` never import each other, and the repeater never touches the proxy, the intercept queue, or the rule engine. The match & replace rule types (`Rule`, `Scope`, `Condition`, `Action`, ...) and the relay types (`Chunk`, `RelaySession`, `RelayChunk`, `RelayTarget`, ...) live in `model`, not in `rules`/`relay`, so `ui` and `proxy` never need to import those packages directly — the same reason `Request`/`Response`/`Outcome` live in `model` for intercept.
 
 ### Request flow
 
@@ -431,6 +503,8 @@ Both paths use `http.Transport.RoundTrip` directly (no redirect following, no co
 **Inside `forward` (Phase 3 + 4):** receive the request → *[pause point 1: if a rule needs the body or request intercept is on, read the whole body (≤ `-max-body`); apply every matching request-direction rule in file order; if request intercept is on, hold the (rule-transformed) request, apply edits or drop]* → build the outbound request (`outbound.BuildRequest`) → `RoundTrip` upstream → *[pause point 2: same thing for the response — rules first, then intercept if enabled]* → relay to the client (streamed normally when nothing needed the body) → save one `model.Exchange`, including which rule(s) fired. A rule that doesn't need the body (header/status-only) still runs even when nothing was buffered.
 
 **Repeater:** UI → `POST /api/repeater/send` → validate the edit form → `repeater.Service.Send` → `outbound.BuildRequest` + shared transport → store the result with `source = repeater`. No listener, no intercept queue.
+
+**Relay (Phase 5), independent of the above:** client connects to a `-relay` target's listen address → `relay.Service` dials the target's upstream (TCP: once per connection; UDP: once per client source address, see [Sessions](#sessions-what-a-session-means)) → two goroutines pump bytes both ways, each `Read()` becoming one chunk → *[if a hold toggle is on for that target/direction: hold the chunk via `holdQueue.Hold`, apply edits or drop]* → forward the (possibly edited) bytes → `storeChunk` records it (capped per `-relay-max-capture`) → on close/eviction, `CloseSession` records final byte counts. No HTTP, no `proxy.forward`, no rule engine (Phase 5.1).
 
 ### UI API
 
@@ -451,6 +525,13 @@ Both paths use `http.Transport.RoundTrip` directly (no redirect following, no co
 | PUT | `/api/rules` | Body `{rules:[...]}`; replaces the whole structured rule list. `400` with a readable error on an invalid rule (previous rules keep running); success returns the same shape as `GET`. |
 | PUT | `/api/rules/raw` | Body `{yaml:"..."}`; replaces the file's raw text verbatim (preserves comments/formatting). Same validation/response as above. |
 | POST | `/api/rules/reload` | Re-reads the rules file from disk (for hand-edits made outside the UI). Same validation/response as above. |
+| GET | `/api/relay` | Configured targets (with their current intercept settings), the shared auto-forward timeout, and every currently held chunk (polled every 500 ms). |
+| PUT | `/api/relay/targets/{name}/settings` | Body `{"up":bool,"down":bool}`. Turning a direction off releases that target's held chunks at it. |
+| GET | `/api/relay/pending/{id}` | One held chunk, hex-encoded (`409` if no longer held). |
+| POST | `/api/relay/pending/{id}/forward` | Empty/`{}` = forward as-is; `{"hex":"..."}` = forward edited (whitespace in the hex is ignored). `400` on invalid hex (item stays held), `409` if already resolved. |
+| POST | `/api/relay/pending/{id}/drop` | Drop the chunk (never forwarded). |
+| GET | `/api/relay/sessions?target=NAME&limit=N` | Session summaries, newest first. `target` omitted = every target. |
+| GET | `/api/relay/sessions/{id}` | Full session detail: every captured chunk, each rendered as a hex dump. |
 
 Every non-GET request must carry the header `X-Requested-With: proxyscope`.
 
@@ -458,9 +539,9 @@ Security notes: when the UI is bound to loopback, requests whose `Host` is not a
 
 ### Database
 
-SQLite file (`-db`), WAL mode, one table `exchanges`; headers are stored as JSON, bodies as BLOBs, timestamps/durations as integer nanoseconds. Schema version is kept in `PRAGMA user_version` (currently **3**). HTTPS is distinguished by the `https://` URL prefix, and failed TLS handshakes are stored as `CONNECT` rows with status 0 and an `error`. **Phase 3 added schema v2** with four columns: `source` (`proxy` = live-captured, `repeater` = replayed), `req_edited` and `resp_edited` (modified in the intercept queue; the stored copy is what was actually sent/delivered), and `note` (non-error annotations such as auto-forwarded or not intercepted). **Phase 4 added schema v3** with two columns: `rule_fired` (cheap boolean for the history list's **M** flag) and `rules_applied` (JSON array of the rule ids that fired, in firing order, used by the detail view). An existing v1 or v2 database is migrated automatically on startup (each in its own transaction; old rows get `rule_fired = 0`, `rules_applied = '[]'`). **A database written by a newer schema version cannot be opened by an older ProxyScope** (it refuses a newer schema). Add a migration step in `store.migrate` when changing the schema. Ids use `AUTOINCREMENT`, so they are never reused after "Clear history". You can inspect the file with any SQLite client (`sqlite3 proxyscope.db`). The database contains decrypted traffic (credentials, cookies): protect and delete it accordingly.
+SQLite file (`-db`), WAL mode, one table `exchanges` plus (since Phase 5) `relay_sessions`/`relay_chunks`; headers are stored as JSON, bodies/chunk data as BLOBs, timestamps/durations as integer nanoseconds. Schema version is kept in `PRAGMA user_version` (currently **4**). HTTPS is distinguished by the `https://` URL prefix, and failed TLS handshakes are stored as `CONNECT` rows with status 0 and an `error`. **Phase 3 added schema v2** with four columns: `source` (`proxy` = live-captured, `repeater` = replayed), `req_edited` and `resp_edited` (modified in the intercept queue; the stored copy is what was actually sent/delivered), and `note` (non-error annotations such as auto-forwarded or not intercepted). **Phase 4 added schema v3** with two columns: `rule_fired` (cheap boolean for the history list's **M** flag) and `rules_applied` (JSON array of the rule ids that fired, in firing order, used by the detail view). **Phase 5 added schema v4**, two new tables (not new columns on `exchanges`, since the data shape is different — no method/URL/status, just raw byte chunks grouped into sessions): `relay_sessions` (one row per TCP connection or UDP client grouping: target, protocol, client/upstream addresses, opened/closed timestamps, byte counts, error) and `relay_chunks` (one row per captured chunk: session id, sequence number shared across both directions, direction, timestamp, data, real size, edited flag, note), indexed on `(session_id, seq)`. An existing v1/v2/v3 database is migrated automatically on startup (each version's migration in its own transaction). **A database written by a newer schema version cannot be opened by an older ProxyScope** (it refuses a newer schema). Add a migration step in `store.migrate` when changing the schema. Ids use `AUTOINCREMENT`, so they are never reused after "Clear history" (which only clears `exchanges`; there is no clear button for relay history yet). You can inspect the file with any SQLite client (`sqlite3 proxyscope.db`). The database contains decrypted/captured traffic (credentials, cookies, game/protocol secrets): protect and delete it accordingly.
 
-Match & replace rules themselves are **not** stored in SQLite: the YAML file (see [Match & replace rules](#match--replace-rules)) is the single source of truth, on purpose, so it stays version-controllable and shareable. Only the *effect* of a rule firing on a given exchange (which rule id(s), in `rules_applied`) is recorded in the database.
+Match & replace rules themselves are **not** stored in SQLite: the YAML file (see [Match & replace rules](#match--replace-rules)) is the single source of truth, on purpose, so it stays version-controllable and shareable. Only the *effect* of a rule firing on a given exchange (which rule id(s), in `rules_applied`) is recorded in the database. Relay **targets** are likewise config-only (the `-relay` flag), not stored in SQLite; only the sessions/chunks that pass through them are.
 
 ## Windows vs Linux
 
@@ -478,9 +559,9 @@ Any future OS-specific code must live in a clearly named file (`*_windows.go` / 
 
 | | Windows | Arch Linux |
 |---|---|---|
-| Builds, unit tests, end-to-end runs | Yes, on every phase | Phase 1 was build-tested; **Phases 2-4 have only been cross-compiled (`GOOS=linux`), not built, tested or run on Arch** |
+| Builds, unit tests, end-to-end runs | Yes, on every phase | Phase 1 was build-tested; **Phases 2-5 have only been cross-compiled (`GOOS=linux`), not built, tested or run on Arch** — Arch verification is paused for now and will resume later in the project, per the project's phase plan |
 
-Phase 4 deliberately adds nothing platform-specific: no syscalls, no file locking, no OS-specific paths; it uses the standard library plus the pure-Go `gopkg.in/yaml.v3` (no CGO, same as the SQLite driver). The rules file lives next to the CA directory using the same `os.UserConfigDir()` layout already used (and cross-compile-verified) since Phase 2, and rules are reloaded with a plain file write + rename, not a platform-specific file-watch API (see [Match & replace rules](#match--replace-rules) for why a UI button was chosen over file-watching). Even so, treat **Phase 4 on Arch as unverified**: on your first run there, do `go vet ./... && go test ./...` and then load a rule, confirm it fires on a real request, and edit it via both the structured form and raw YAML before relying on it. The same applies to Phases 2-3 (see above).
+Phase 5 deliberately adds nothing platform-specific: no syscalls, no file locking, no OS-specific paths; the relay is built entirely on the standard library `net` package (`net.Listen`, `net.ListenUDP`, `net.Dialer`), the same cross-platform primitives the HTTP proxy and CONNECT tunneling already use. UDP session eviction uses a plain `time.Ticker`, not a platform-specific timer API. Even so, treat **Phase 5 on Arch as unverified**, same as Phases 2-4: on your first run there, do `go vet ./... && go test ./...` and then relay one TCP and one UDP session through a real target (see [Generic TCP/UDP relay](#generic-tcpudp-relay)), confirming both plain forwarding and a manual hold/edit/forward, before relying on it.
 
 ## Development
 
@@ -490,8 +571,9 @@ go test ./...          # add -race where a C compiler is available
 gofmt -l .             # must print nothing
 ```
 
-Tests cover forwarding, chunked bodies in both directions, body truncation, connection-refused → 502, header timeout → 504, CA creation/reload/tamper detection, leaf issuing/verification/caching and name validation, full HTTPS interception (decrypt, record, keep-alive), upstream validation on/off, a client rejecting the fake certificate, a client vanishing mid-handshake, invalid SNI, CONNECT target parsing, the SQLite round trip and the v1 → v2 migration, body rendering, and the UI guard. Phase 3 adds tests for the intercept manager (edit, drop, timeout, client disconnect, releasing on toggle-off, 25 concurrent held requests resolved out of order), the pause points in the real proxy (request/response edit and drop over HTTP and HTTPS, editing the target host, oversized/streaming bodies not held, a held request not blocking others), the intercept and repeater APIs (including invalid edits leaving the item held), body edit rules (gzip, CRLF), and the repeater (replayed marking, no redirect following, error results, upstream validation flag, body cap). Phase 4 adds tests for the rules engine (validation errors including malformed regex/impossible conditions/bad capture-group references, scope matching including wildcard hosts and path prefix/regex, every condition and action type, multi-rule ordering where a later rule sees an earlier one's edit, a body-touching rule never firing without a buffered body, atomic reload where a bad file leaves the previous rules running), the pause points (a rule firing with intercept off, rules running before an enabled intercept hold sees the message, a header-only rule not forcing body buffering, the oversized-body skip note), the rules API (structured save, raw YAML save, reload, validation failures leaving the previous rules active), and the v2 → v3 migration. See `CLAUDE.md` for repo conventions (also intended for future Claude sessions).
+Tests cover forwarding, chunked bodies in both directions, body truncation, connection-refused → 502, header timeout → 504, CA creation/reload/tamper detection, leaf issuing/verification/caching and name validation, full HTTPS interception (decrypt, record, keep-alive), upstream validation on/off, a client rejecting the fake certificate, a client vanishing mid-handshake, invalid SNI, CONNECT target parsing, the SQLite round trip and the v1 → v2 migration, body rendering, and the UI guard. Phase 3 adds tests for the intercept manager (edit, drop, timeout, client disconnect, releasing on toggle-off, 25 concurrent held requests resolved out of order), the pause points in the real proxy (request/response edit and drop over HTTP and HTTPS, editing the target host, oversized/streaming bodies not held, a held request not blocking others), the intercept and repeater APIs (including invalid edits leaving the item held), body edit rules (gzip, CRLF), and the repeater (replayed marking, no redirect following, error results, upstream validation flag, body cap). Phase 4 adds tests for the rules engine (validation errors including malformed regex/impossible conditions/bad capture-group references, scope matching including wildcard hosts and path prefix/regex, every condition and action type, multi-rule ordering where a later rule sees an earlier one's edit, a body-touching rule never firing without a buffered body, atomic reload where a bad file leaves the previous rules running), the pause points (a rule firing with intercept off, rules running before an enabled intercept hold sees the message, a header-only rule not forcing body buffering, the oversized-body skip note), the rules API (structured save, raw YAML save, reload, validation failures leaving the previous rules active), and the v2 → v3 migration. Phase 5 adds tests for the relay engine (real TCP/UDP forwarding and capture over loopback sockets, upstream dial failure recorded without crashing, UDP sessions correctly grouped by client source address, idle UDP sessions evicted and closed, the capture cap stopping storage while still forwarding in full, many concurrent TCP sessions not blocking each other), the hold queue (edit/drop/timeout/shutdown-release/toggle-off, 25 concurrent held chunks resolved independently, held items scoped to their own target+direction), the `-relay`/`-relay-max-capture`/`-relay-udp-idle-timeout` flags (parsing, validation, duplicate target names), the relay store tables and the v3 → v4 migration, and a full UI-API-level test that holds a real chunk over a real TCP connection, edits it through the HTTP handler, and confirms the upstream received the edited bytes. See `CLAUDE.md` for repo conventions (also intended for future Claude sessions).
 
 ## Roadmap (not implemented)
 
-- **Phase 5**: generic TCP/UDP relay as a separate module in the same project.
+- **Phase 5.1**: byte-level match & replace rules for the relay (the Phase 4 rule engine, generalized or paralleled for raw TCP/UDP chunks instead of HTTP messages). Deliberately deferred until there's real usage experience running the manual relay against an actual binary protocol, so the rule schema is shaped by a real need rather than guessed upfront.
+- **Phase 6**: system-wide traffic capture (WinDivert on Windows, NFQUEUE on Linux), removing the need to point each client explicitly at a proxy/relay listen address.

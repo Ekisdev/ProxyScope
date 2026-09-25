@@ -180,3 +180,114 @@ func TestSchemaV2DatabaseIsMigrated(t *testing.T) {
 		t.Fatalf("summaries = %+v", all)
 	}
 }
+
+func TestSchemaV3DatabaseIsMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// Build a schema-v3 database (as created by Phase 4) with one row.
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{schemaV1, schemaV2, schemaV3} {
+		if _, err := old.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = old.Exec(`INSERT INTO exchanges (ts_ns, duration_ns, method, url, host, path, proto, req_headers, req_body_size, status, resp_headers, resp_body_size, source, req_edited, resp_edited, note, rule_fired, rules_applied)
+		VALUES (1, 2, 'GET', 'http://old/', 'old', '/', 'HTTP/1.1', '{}', 0, 200, '{}', 0, 'proxy', 0, 0, '', 0, '[]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Exec("PRAGMA user_version = 3")
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// The old exchange row is untouched, and the new relay tables work.
+	if _, err := s.Get(ctx, 1); err != nil {
+		t.Fatalf("old row: %v", err)
+	}
+	sess := &model.RelaySession{Target: "t1", Protocol: model.RelayTCP, ClientAddr: "1.2.3.4:5", UpstreamAddr: "up:1", OpenedAt: time.Now()}
+	if err := s.OpenSession(ctx, sess); err != nil || sess.ID == 0 {
+		t.Fatalf("OpenSession: %v %+v", err, sess)
+	}
+	sessions, _ := s.ListRelaySessions(ctx, "", 10)
+	if len(sessions) != 1 || sessions[0].ID != sess.ID {
+		t.Fatalf("sessions after migration = %+v", sessions)
+	}
+}
+
+func TestRelaySessionAndChunkRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sess := &model.RelaySession{
+		Target: "game1", Protocol: model.RelayTCP, ClientAddr: "127.0.0.1:1111",
+		UpstreamAddr: "game.example.com:9100", OpenedAt: time.Now(),
+	}
+	if err := s.OpenSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	if sess.ID != 1 {
+		t.Fatalf("id = %d", sess.ID)
+	}
+
+	// Still open: not returned as closed, ClosedAt is nil in the summary.
+	list, err := s.ListRelaySessions(ctx, "game1", 10)
+	if err != nil || len(list) != 1 || list[0].ClosedAt != nil {
+		t.Fatalf("list (open) = %+v err=%v", list, err)
+	}
+
+	up := &model.RelayChunk{SessionID: sess.ID, Seq: 1, Direction: model.RelayUp, Timestamp: time.Now(), Data: []byte("hello"), DataSize: 5}
+	down := &model.RelayChunk{SessionID: sess.ID, Seq: 2, Direction: model.RelayDown, Timestamp: time.Now(), Data: []byte("hi"), DataSize: 100, Edited: true, Note: "capped"}
+	if err := s.SaveChunk(ctx, up); err != nil || up.ID == 0 {
+		t.Fatalf("SaveChunk up: %v %+v", err, up)
+	}
+	if err := s.SaveChunk(ctx, down); err != nil || down.ID == 0 {
+		t.Fatalf("SaveChunk down: %v %+v", err, down)
+	}
+
+	chunks, err := s.ListRelayChunks(ctx, sess.ID)
+	if err != nil || len(chunks) != 2 {
+		t.Fatalf("chunks = %+v err=%v", chunks, err)
+	}
+	if chunks[0].Direction != model.RelayUp || string(chunks[0].Data) != "hello" || chunks[0].DataTruncated() {
+		t.Fatalf("chunk 0 = %+v", chunks[0])
+	}
+	if chunks[1].Direction != model.RelayDown || !chunks[1].Edited || chunks[1].Note != "capped" || !chunks[1].DataTruncated() {
+		t.Fatalf("chunk 1 = %+v", chunks[1])
+	}
+
+	if err := s.CloseSession(ctx, sess.ID, time.Now(), 5, 2, ""); err != nil {
+		t.Fatal(err)
+	}
+	full, err := s.GetRelaySession(ctx, sess.ID)
+	if err != nil || full.ClosedAt.IsZero() || full.BytesUp != 5 || full.BytesDown != 2 {
+		t.Fatalf("get after close = %+v err=%v", full, err)
+	}
+	list, _ = s.ListRelaySessions(ctx, "", 10)
+	if len(list) != 1 || list[0].ClosedAt == nil {
+		t.Fatalf("list (closed) = %+v", list)
+	}
+
+	if _, err := s.GetRelaySession(ctx, 999); !errors.Is(err, model.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+
+	// A different target is excluded by the target filter.
+	other := &model.RelaySession{Target: "game2", Protocol: model.RelayUDP, ClientAddr: "x", UpstreamAddr: "y", OpenedAt: time.Now()}
+	s.OpenSession(ctx, other)
+	filtered, _ := s.ListRelaySessions(ctx, "game1", 10)
+	if len(filtered) != 1 {
+		t.Fatalf("target filter leaked: %+v", filtered)
+	}
+}

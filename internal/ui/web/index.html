@@ -14,6 +14,7 @@
     <button data-view="intercept">Intercept <span id="badge" class="badge" hidden>0</span></button>
     <button data-view="repeater">Repeater <span id="rbadge" class="badge quiet" hidden>0</span></button>
     <button data-view="rules">Rules</button>
+    <button data-view="relay">Relay</button>
   </nav>
   <span class="spacer"></span>
   <a id="ca" href="ca.crt" download="proxyscope-ca.crt" title="Public root CA certificate: install it in your OS/browser trust store to decrypt HTTPS">CA certificate</a>
@@ -103,10 +104,35 @@
   </div>
 </section>
 
+<!-- ===== Relay ===== -->
+<section id="view-relay" class="view" hidden>
+  <div class="toolbar">
+    <div id="relay-targets" class="relay-targets"></div>
+  </div>
+  <div class="split">
+    <aside id="relay-list">
+      <h2>Held chunks</h2>
+      <table>
+        <thead><tr><th>#</th><th>Target</th><th>Dir</th><th>Session</th><th>Size</th><th>Auto-fwd</th></tr></thead>
+        <tbody id="relay-pending-rows"></tbody>
+      </table>
+      <p id="relay-pending-empty" class="muted empty">Nothing held. Turn on intercept above for a target and send it traffic.</p>
+      <h2>Sessions</h2>
+      <table>
+        <thead><tr><th>#</th><th>Target</th><th>Proto</th><th>Client</th><th>Opened</th><th>Up</th><th>Down</th><th>Status</th></tr></thead>
+        <tbody id="relay-session-rows"></tbody>
+      </table>
+      <p id="relay-sessions-empty" class="muted empty">No relay sessions yet.</p>
+    </aside>
+    <div id="relay-detail" class="editor"><p class="muted empty">Select a held chunk or a session to inspect it.</p></div>
+  </div>
+</section>
+
 <script src="core.js"></script>
 <script src="history.js"></script>
 <script src="intercept.js"></script>
 <script src="repeater.js"></script>
 <script src="rules.js"></script>
+<script src="relay.js"></script>
 </body>
 </html>

@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"proxyscope/internal/model"
 	"proxyscope/internal/outbound"
 	"proxyscope/internal/proxy"
+	"proxyscope/internal/relay"
 	"proxyscope/internal/repeater"
 	"proxyscope/internal/rules"
 	"proxyscope/internal/store"
@@ -96,12 +99,25 @@ func run() error {
 	if cfg.InsecureUpstream {
 		log.Warn("upstream TLS certificate validation is DISABLED (-insecure-upstream)")
 	}
-	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, Rules: re, CAPEM: authority.CertPEM()}, log)
+
+	relayTargets := make([]relay.Target, len(cfg.RelayTargets))
+	for i, t := range cfg.RelayTargets {
+		relayTargets[i] = relay.Target{Name: t.Name, Protocol: model.RelayProtocol(t.Protocol), Listen: t.Listen, Upstream: t.Upstream}
+		if !isLoopbackHostPort(t.Listen) {
+			log.Warn("relay target listens on a non-loopback address; captured traffic (credentials, game/protocol secrets) will be reachable from your network", "target", t.Name, "listen", t.Listen)
+		}
+	}
+	rel := relay.New(relay.Config{
+		Targets: relayTargets, DialTimeout: cfg.DialTimeout,
+		MaxCapture: cfg.RelayMaxCapture, UDPIdleTimeout: cfg.RelayUDPIdleTimeout, InterceptTimeout: cfg.InterceptTimeout,
+	}, st, log)
+
+	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, Rules: re, Relay: rel, CAPEM: authority.CertPEM()}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() {
 		if err := px.ListenAndServe(); err != nil {
 			errc <- fmt.Errorf("proxy: %w", err)
@@ -110,6 +126,11 @@ func run() error {
 	go func() {
 		if err := web.ListenAndServe(); err != nil {
 			errc <- fmt.Errorf("ui: %w", err)
+		}
+	}()
+	go func() {
+		if err := rel.ListenAndServe(); err != nil {
+			errc <- fmt.Errorf("relay: %w", err)
 		}
 	}()
 
@@ -127,5 +148,21 @@ func run() error {
 	defer cancel()
 	_ = px.Shutdown(shutCtx)
 	_ = web.Shutdown(shutCtx)
+	_ = rel.Shutdown(shutCtx) // also releases every held relay chunk, see relay.Service.Shutdown
 	return runErr
+}
+
+// isLoopbackHostPort reports whether addr's host is loopback ("127.0.0.1",
+// "::1", "localhost"); used only to decide whether to warn about a relay
+// target listening on a non-loopback address.
+func isLoopbackHostPort(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
