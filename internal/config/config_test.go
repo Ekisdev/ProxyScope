@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDefaultCADirUsesEkisdeDevLayout(t *testing.T) {
@@ -28,5 +29,20 @@ func TestParseFlags(t *testing.T) {
 	}
 	if def, _ := Parse(nil, io.Discard); def.InsecureUpstream {
 		t.Fatal("upstream validation must be ON by default")
+	}
+}
+
+func TestInterceptTimeoutFlag(t *testing.T) {
+	if def, _ := Parse(nil, io.Discard); def.InterceptTimeout != time.Minute {
+		t.Fatalf("default = %v, want 1m", def.InterceptTimeout)
+	}
+	if cfg, err := Parse([]string{"-intercept-timeout", "0"}, io.Discard); err != nil || cfg.InterceptTimeout != 0 {
+		t.Fatalf("0 must disable the timeout: %+v %v", cfg, err)
+	}
+	if cfg, err := Parse([]string{"-intercept-timeout", "5m"}, io.Discard); err != nil || cfg.InterceptTimeout != 5*time.Minute {
+		t.Fatalf("5m: %+v %v", cfg, err)
+	}
+	if _, err := Parse([]string{"-intercept-timeout", "-1s"}, io.Discard); err == nil {
+		t.Fatal("negative timeout must be rejected")
 	}
 }

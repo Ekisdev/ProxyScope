@@ -15,7 +15,11 @@ import (
 
 	"proxyscope/internal/ca"
 	"proxyscope/internal/config"
+	"proxyscope/internal/intercept"
+	"proxyscope/internal/model"
+	"proxyscope/internal/outbound"
 	"proxyscope/internal/proxy"
+	"proxyscope/internal/repeater"
 	"proxyscope/internal/store"
 	"proxyscope/internal/ui"
 )
@@ -66,17 +70,25 @@ func run() error {
 	// Only public information is logged: never the key.
 	log.Info("root CA loaded", "cert", authority.CertPath(), "sha256", authority.Fingerprint())
 
-	px := proxy.New(proxy.Config{
-		Addr:             cfg.ProxyAddr,
-		MaxBodyBytes:     cfg.MaxBodyBytes,
+	// Dialing, timeouts and upstream TLS validation are shared by the proxy and
+	// the repeater, so both behave identically.
+	out := outbound.Config{
 		DialTimeout:      cfg.DialTimeout,
 		HeaderTimeout:    cfg.HeaderTimeout,
 		InsecureUpstream: cfg.InsecureUpstream,
-	}, st, authority, log)
+	}
+	icpt := intercept.New(cfg.InterceptTimeout)
+	px := proxy.New(proxy.Config{
+		Addr:         cfg.ProxyAddr,
+		MaxBodyBytes: cfg.MaxBodyBytes,
+		Outbound:     out,
+	}, st, authority, icpt, log)
+	rep := repeater.New(repeater.Config{MaxBodyBytes: cfg.MaxBodyBytes, Outbound: out}, st)
+	defer rep.Close()
 	if cfg.InsecureUpstream {
 		log.Warn("upstream TLS certificate validation is DISABLED (-insecure-upstream)")
 	}
-	web := ui.New(cfg.UIAddr, st, authority.CertPEM(), log)
+	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, CAPEM: authority.CertPEM()}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -100,6 +112,9 @@ func run() error {
 	case runErr = <-errc: // e.g. port already in use
 	}
 
+	// Release anything held in the intercept queue so graceful shutdown does not
+	// wait for requests nobody will resolve any more.
+	icpt.SetSettings(model.InterceptSettings{})
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = px.Shutdown(shutCtx)

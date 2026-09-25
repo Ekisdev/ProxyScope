@@ -27,6 +27,9 @@ type bodyView struct {
 	DecodedFrom string `json:"decodedFrom,omitempty"` // e.g. "gzip"
 	Clipped     bool   `json:"clipped,omitempty"`     // content cut for display only
 	Content     string `json:"content"`
+	// Editable is set only for bodies offered in an edit form: valid UTF-8 text
+	// that is complete (not truncated, clipped or partially decompressed).
+	Editable bool `json:"editable,omitempty"`
 }
 
 // renderBody turns raw stored bytes into something displayable: it undoes
@@ -42,12 +45,8 @@ func renderBody(h http.Header, body []byte, size int64) bodyView {
 	if len(body) == 0 {
 		return v
 	}
-	data := body
-	if enc := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding"))); enc != "" {
-		if dec, ok := decode(enc, body); ok {
-			data, v.DecodedFrom = dec, enc
-		}
-	}
+	data, from := decodeForDisplay(h, body)
+	v.DecodedFrom = from
 	if text, ok := asText(data, v.Truncated || v.DecodedFrom != ""); ok {
 		if len(text) > maxTextView {
 			text, v.Clipped = text[:maxTextView], true
@@ -105,4 +104,16 @@ func asText(data []byte, lenient bool) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// decodeForDisplay returns the body as a person would read it: decompressed
+// when Content-Encoding is gzip/deflate and decoding works, together with the
+// encoding that was undone ("" if none). Otherwise the raw bytes.
+func decodeForDisplay(h http.Header, body []byte) (data []byte, decodedFrom string) {
+	if enc := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding"))); enc != "" && len(body) > 0 {
+		if dec, ok := decode(enc, body); ok {
+			return dec, enc
+		}
+	}
+	return body, ""
 }

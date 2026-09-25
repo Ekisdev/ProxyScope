@@ -20,7 +20,7 @@ import (
 
 // schemaVersion is stored in PRAGMA user_version. Bump it and add a migration
 // step in migrate() whenever the schema changes.
-const schemaVersion = 1
+const schemaVersion = 2
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS exchanges (
@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS exchanges (
 	resp_body_size INTEGER NOT NULL,
 	error          TEXT    NOT NULL DEFAULT ''
 );`
+
+// schemaV2 (Phase 3) marks replayed traffic and intercept edits.
+const schemaV2 = `
+ALTER TABLE exchanges ADD COLUMN source      TEXT    NOT NULL DEFAULT 'proxy';
+ALTER TABLE exchanges ADD COLUMN req_edited  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE exchanges ADD COLUMN resp_edited INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE exchanges ADD COLUMN note        TEXT    NOT NULL DEFAULT '';`
 
 // Store is a SQLite-backed exchange store. It is safe for concurrent use.
 type Store struct {
@@ -84,14 +91,33 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("create schema: %w", err)
 		}
 	}
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-		return fmt.Errorf("set schema version: %w", err)
+	if v < 2 {
+		// One transaction (including the version bump) so a crash cannot leave
+		// half-added columns behind.
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(schemaV2); err != nil {
+			return fmt.Errorf("migrate to schema v2: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration: %w", err)
+		}
 	}
 	return nil
 }
 
 // Save inserts ex and sets ex.ID. It satisfies proxy.Sink.
 func (s *Store) Save(ctx context.Context, ex *model.Exchange) error {
+	source := ex.Source
+	if source == "" {
+		source = model.SourceProxy
+	}
 	reqH, err := json.Marshal(ex.ReqHeaders)
 	if err != nil {
 		return fmt.Errorf("encode request headers: %w", err)
@@ -102,10 +128,12 @@ func (s *Store) Save(ctx context.Context, ex *model.Exchange) error {
 	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO exchanges (ts_ns, duration_ns, method, url, host, path, proto,
-			req_headers, req_body, req_body_size, status, resp_headers, resp_body, resp_body_size, error)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			req_headers, req_body, req_body_size, status, resp_headers, resp_body, resp_body_size, error,
+			source, req_edited, resp_edited, note)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ex.Timestamp.UnixNano(), int64(ex.Duration), ex.Method, ex.URL, ex.Host, ex.Path, ex.Proto,
-		string(reqH), ex.ReqBody, ex.ReqBodySize, ex.StatusCode, string(respH), ex.RespBody, ex.RespBodySize, ex.Error)
+		string(reqH), ex.ReqBody, ex.ReqBodySize, ex.StatusCode, string(respH), ex.RespBody, ex.RespBodySize, ex.Error,
+		source, ex.ReqEdited, ex.RespEdited, ex.Note)
 	if err != nil {
 		return fmt.Errorf("insert exchange: %w", err)
 	}
@@ -117,7 +145,7 @@ func (s *Store) Save(ctx context.Context, ex *model.Exchange) error {
 // rows newer than afterID (used for polling); with afterID == 0 it returns the
 // most recent limit rows.
 func (s *Store) List(ctx context.Context, afterID int64, limit int) ([]model.Summary, error) {
-	const cols = `id, ts_ns, duration_ns, method, url, host, path, status, resp_body_size, error`
+	const cols = `id, ts_ns, duration_ns, method, url, host, path, status, resp_body_size, error, source, (req_edited OR resp_edited) AS edited, note`
 	var (
 		rows *sql.Rows
 		err  error
@@ -127,7 +155,8 @@ func (s *Store) List(ctx context.Context, afterID int64, limit int) ([]model.Sum
 			`SELECT `+cols+` FROM exchanges WHERE id > ? ORDER BY id ASC LIMIT ?`, afterID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM (SELECT `+cols+` FROM exchanges ORDER BY id DESC LIMIT ?) ORDER BY id ASC`, limit)
+			`SELECT id, ts_ns, duration_ns, method, url, host, path, status, resp_body_size, error, source, edited, note
+			 FROM (SELECT `+cols+` FROM exchanges ORDER BY id DESC LIMIT ?) ORDER BY id ASC`, limit)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list exchanges: %w", err)
@@ -141,7 +170,7 @@ func (s *Store) List(ctx context.Context, afterID int64, limit int) ([]model.Sum
 			tsNs  int64
 			durNs int64
 		)
-		if err := rows.Scan(&m.ID, &tsNs, &durNs, &m.Method, &m.URL, &m.Host, &m.Path, &m.StatusCode, &m.RespBodySize, &m.Error); err != nil {
+		if err := rows.Scan(&m.ID, &tsNs, &durNs, &m.Method, &m.URL, &m.Host, &m.Path, &m.StatusCode, &m.RespBodySize, &m.Error, &m.Source, &m.Edited, &m.Note); err != nil {
 			return nil, fmt.Errorf("scan exchange: %w", err)
 		}
 		m.Timestamp = time.Unix(0, tsNs)
@@ -160,10 +189,12 @@ func (s *Store) Get(ctx context.Context, id int64) (*model.Exchange, error) {
 	)
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, ts_ns, duration_ns, method, url, host, path, proto,
-			req_headers, req_body, req_body_size, status, resp_headers, resp_body, resp_body_size, error
+			req_headers, req_body, req_body_size, status, resp_headers, resp_body, resp_body_size, error,
+			source, req_edited, resp_edited, note
 		 FROM exchanges WHERE id = ?`, id).
 		Scan(&ex.ID, &tsNs, &durNs, &ex.Method, &ex.URL, &ex.Host, &ex.Path, &ex.Proto,
-			&reqH, &ex.ReqBody, &ex.ReqBodySize, &ex.StatusCode, &respH, &ex.RespBody, &ex.RespBodySize, &ex.Error)
+			&reqH, &ex.ReqBody, &ex.ReqBodySize, &ex.StatusCode, &respH, &ex.RespBody, &ex.RespBodySize, &ex.Error,
+			&ex.Source, &ex.ReqEdited, &ex.RespEdited, &ex.Note)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, model.ErrNotFound
 	}

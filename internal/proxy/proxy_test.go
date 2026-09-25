@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"io"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 
 	"proxyscope/internal/ca"
 	"proxyscope/internal/model"
+	"proxyscope/internal/outbound"
 )
 
 type memSink struct {
@@ -43,22 +45,36 @@ func (m *memSink) last(t *testing.T) *model.Exchange {
 // that uses it, plus the sink that records exchanges.
 func newProxyClient(t *testing.T, maxBody int64) (*http.Client, *memSink) {
 	t.Helper()
-	u, sink, _ := startProxy(t, Config{MaxBodyBytes: maxBody, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second})
+	u, sink, _ := startProxy(t, testCfg(maxBody, 2*time.Second, false))
 	return &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(u)},
 		Timeout:   5 * time.Second,
 	}, sink
 }
 
-// startProxy serves a Proxy (with a fresh temporary CA) on a random port.
-func startProxy(t *testing.T, cfg Config) (*url.URL, *memSink, *ca.Authority) {
+func testCfg(maxBody int64, headerTimeout time.Duration, insecure bool) Config {
+	return Config{MaxBodyBytes: maxBody, Outbound: outbound.Config{DialTimeout: time.Second, HeaderTimeout: headerTimeout, InsecureUpstream: insecure}}
+}
+
+func withRootCAs(c Config, pool *x509.CertPool) Config {
+	c.Outbound.RootCAs = pool
+	return c
+}
+
+// startProxy serves a Proxy (with a fresh temporary CA) on a random port. An
+// optional Interceptor enables the live-intercept pause points.
+func startProxy(t *testing.T, cfg Config, icpt ...Interceptor) (*url.URL, *memSink, *ca.Authority) {
 	t.Helper()
 	authority, _, err := ca.LoadOrCreate(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	sink := &memSink{}
-	p := New(cfg, sink, authority, slog.New(slog.DiscardHandler))
+	var ic Interceptor
+	if len(icpt) > 0 {
+		ic = icpt[0]
+	}
+	p := New(cfg, sink, authority, ic, slog.New(slog.DiscardHandler))
 	srv := httptest.NewServer(p)
 	t.Cleanup(func() { p.Shutdown(context.Background()); srv.Close() })
 	u, _ := url.Parse(srv.URL)
@@ -170,7 +186,7 @@ func TestHeaderTimeoutReturns504(t *testing.T) {
 		time.Sleep(600 * time.Millisecond)
 	}))
 	defer up.Close()
-	u, _, _ := startProxy(t, Config{MaxBodyBytes: 1 << 10, DialTimeout: time.Second, HeaderTimeout: 100 * time.Millisecond})
+	u, _, _ := startProxy(t, testCfg(1<<10, 100*time.Millisecond, false))
 	c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}, Timeout: 5 * time.Second}
 
 	resp, err := c.Get(up.URL)

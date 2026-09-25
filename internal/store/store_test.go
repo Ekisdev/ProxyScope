@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"path/filepath"
@@ -78,4 +79,58 @@ func TestSaveGetListClear(t *testing.T) {
 	if ex.ID != 4 {
 		t.Fatalf("ids must not be reused after clear, got %d", ex.ID)
 	}
+}
+
+func TestSchemaV1DatabaseIsMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// Build a schema-v1 database (as created by Phases 1-2) with one row.
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(schemaV1); err != nil {
+		t.Fatal(err)
+	}
+	_, err = old.Exec(`INSERT INTO exchanges (ts_ns, duration_ns, method, url, host, path, proto, req_headers, req_body_size, status, resp_headers, resp_body_size)
+		VALUES (1, 2, 'GET', 'http://old/', 'old', '/', 'HTTP/1.1', '{}', 0, 200, '{}', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Exec("PRAGMA user_version = 1")
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	got, err := s.Get(ctx, 1)
+	if err != nil || got.Source != model.SourceProxy || got.ReqEdited || got.Note != "" {
+		t.Fatalf("migrated row = %+v err=%v", got, err)
+	}
+
+	// New columns work, and the summary reports replayed/edited/note.
+	ex := sample(1)
+	ex.Source, ex.RespEdited, ex.Note = model.SourceRepeater, true, "hello"
+	if err := s.Save(ctx, ex); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := s.List(ctx, 0, 10)
+	last := all[len(all)-1]
+	if last.Source != model.SourceRepeater || !last.Edited || last.Note != "hello" || all[0].Source != model.SourceProxy || all[0].Edited {
+		t.Fatalf("summaries = %+v", all)
+	}
+	full, _ := s.Get(ctx, ex.ID)
+	if full.Source != model.SourceRepeater || !full.RespEdited || full.ReqEdited {
+		t.Fatalf("full = %+v", full)
+	}
+
+	// Reopening a migrated database is a no-op.
+	s.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	s2.Close()
 }

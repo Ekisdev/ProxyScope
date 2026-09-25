@@ -46,11 +46,8 @@ func TestHTTPSInterceptionIsDecryptedAndRecorded(t *testing.T) {
 	up := newTLSUpstream(t)
 	upPool := x509.NewCertPool()
 	upPool.AddCert(up.Certificate())
-	pu, sink, authority := startProxy(t, Config{
-		MaxBodyBytes: 1 << 20, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second,
-		UpstreamRootCAs: upPool, // trust the test upstream's self-signed cert
-	})
-	c := httpsClient(pu, caPool(authority)) // client trusts only the ProxyScope CA
+	pu, sink, authority := startProxy(t, withRootCAs(testCfg(1<<20, 2*time.Second, false), upPool)) // trust the test upstream's self-signed cert
+	c := httpsClient(pu, caPool(authority))                                                         // client trusts only the ProxyScope CA
 
 	resp, err := c.Post(up.URL+"/p?q=1", "text/plain", strings.NewReader("hello"))
 	if err != nil {
@@ -76,7 +73,7 @@ func TestHTTPSInterceptionIsDecryptedAndRecorded(t *testing.T) {
 
 func TestKeepAliveTunnelServesMultipleRequests(t *testing.T) {
 	up := newTLSUpstream(t)
-	pu, sink, authority := startProxy(t, Config{MaxBodyBytes: 1 << 20, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second, InsecureUpstream: true})
+	pu, sink, authority := startProxy(t, testCfg(1<<20, 2*time.Second, true))
 	c := httpsClient(pu, caPool(authority))
 	for _, path := range []string{"/a", "/b", "/c"} {
 		resp, err := c.Get(up.URL + path)
@@ -95,7 +92,7 @@ func TestKeepAliveTunnelServesMultipleRequests(t *testing.T) {
 
 func TestUpstreamCertValidationOnByDefault(t *testing.T) {
 	up := newTLSUpstream(t) // self-signed, not in system roots
-	pu, sink, authority := startProxy(t, Config{MaxBodyBytes: 1 << 20, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second})
+	pu, sink, authority := startProxy(t, testCfg(1<<20, 2*time.Second, false))
 	c := httpsClient(pu, caPool(authority))
 
 	resp, err := c.Get(up.URL + "/")
@@ -115,7 +112,7 @@ func TestUpstreamCertValidationOnByDefault(t *testing.T) {
 
 func TestInsecureUpstreamAcceptsInvalidCert(t *testing.T) {
 	up := newTLSUpstream(t)
-	pu, _, authority := startProxy(t, Config{MaxBodyBytes: 1 << 20, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second, InsecureUpstream: true})
+	pu, _, authority := startProxy(t, testCfg(1<<20, 2*time.Second, true))
 	resp, err := httpsClient(pu, caPool(authority)).Get(up.URL + "/x")
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +125,7 @@ func TestInsecureUpstreamAcceptsInvalidCert(t *testing.T) {
 
 func TestClientRejectingFakeCertFailsCleanlyAndIsRecorded(t *testing.T) {
 	up := newTLSUpstream(t)
-	pu, sink, _ := startProxy(t, Config{MaxBodyBytes: 1 << 20, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second, InsecureUpstream: true})
+	pu, sink, _ := startProxy(t, testCfg(1<<20, 2*time.Second, true))
 	c := httpsClient(pu, nil) // client does NOT trust the ProxyScope CA
 
 	if _, err := c.Get(up.URL + "/"); err == nil {
@@ -152,7 +149,7 @@ func TestClientRejectingFakeCertFailsCleanlyAndIsRecorded(t *testing.T) {
 
 func TestClientClosingMidHandshakeIsRecorded(t *testing.T) {
 	// Open a tunnel, then vanish before sending a ClientHello.
-	pu, sink, _ := startProxy(t, Config{MaxBodyBytes: 1 << 10, DialTimeout: time.Second, HeaderTimeout: time.Second})
+	pu, sink, _ := startProxy(t, testCfg(1<<10, time.Second, false))
 	conn, err := net.Dial("tcp", pu.Host)
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +181,7 @@ func TestClientClosingMidHandshakeIsRecorded(t *testing.T) {
 }
 
 func TestInvalidSNIIsRejected(t *testing.T) {
-	pu, sink, authority := startProxy(t, Config{MaxBodyBytes: 1 << 10, DialTimeout: time.Second, HeaderTimeout: time.Second})
+	pu, sink, authority := startProxy(t, testCfg(1<<10, time.Second, false))
 	conn, err := net.Dial("tcp", pu.Host)
 	if err != nil {
 		t.Fatal(err)

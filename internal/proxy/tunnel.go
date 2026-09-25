@@ -97,14 +97,11 @@ func (p *Proxy) serveTunnel(conn net.Conn, creq *http.Request, host, port string
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	upstreamTLS := &tls.Config{
-		InsecureSkipVerify: p.cfg.InsecureUpstream, // opt-in via -insecure-upstream
-		RootCAs:            p.cfg.UpstreamRootCAs,
+	serverName := leafName
+	if net.ParseIP(leafName) != nil {
+		serverName = "" // for IPs, net/http verifies against the dialed address
 	}
-	if net.ParseIP(leafName) == nil {
-		upstreamTLS.ServerName = leafName
-	} // for IPs, net/http verifies against the dialed address
-	tr := p.newTransport(upstreamTLS)
+	tr := p.out.NewTransport(p.out.TLSConfig(serverName))
 	defer tr.CloseIdleConnections()
 
 	srv := &http.Server{

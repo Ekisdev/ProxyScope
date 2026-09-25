@@ -9,41 +9,80 @@
 <body>
 <header>
   <h1>proxyscope</h1>
-  <input id="filter" type="search" placeholder="Filter (method, host, path, status)…" autocomplete="off">
-  <span id="count" class="muted"></span>
+  <nav id="tabs">
+    <button data-view="history" class="active">History</button>
+    <button data-view="intercept">Intercept <span id="badge" class="badge" hidden>0</span></button>
+    <button data-view="repeater">Repeater <span id="rbadge" class="badge quiet" hidden>0</span></button>
+  </nav>
   <span class="spacer"></span>
   <a id="ca" href="ca.crt" download="proxyscope-ca.crt" title="Public root CA certificate: install it in your OS/browser trust store to decrypt HTTPS">CA certificate</a>
-  <label class="muted"><input id="autoscroll" type="checkbox" checked> auto-scroll</label>
-  <button id="pause">Pause</button>
-  <button id="clear">Clear history</button>
   <span id="conn" class="conn ok" title="connection to proxyscope">●</span>
 </header>
 
-<main>
-  <section id="list">
-    <table>
-      <thead>
-        <tr><th>#</th><th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Size</th><th>Time (ms)</th></tr>
-      </thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <p id="empty" class="muted empty">No traffic yet. Point your browser's HTTP proxy at the proxy port and load an http:// page.</p>
-  </section>
+<!-- ===== History ===== -->
+<section id="view-history" class="view">
+  <div class="toolbar">
+    <input id="filter" type="search" placeholder="Filter (method, URL, status)…" autocomplete="off">
+    <span id="count" class="muted"></span>
+    <span class="spacer"></span>
+    <label class="muted"><input id="hide-replayed" type="checkbox"> hide replayed</label>
+    <label class="muted"><input id="autoscroll" type="checkbox" checked> auto-scroll</label>
+    <button id="pause">Pause</button>
+    <button id="clear">Clear history</button>
+  </div>
+  <main>
+    <section id="list">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Size</th><th>Time (ms)</th><th title="R = replayed from the repeater, E = edited in intercept, N = has a note">Flags</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" class="muted empty">No traffic yet. Point your browser's HTTP proxy at the proxy port and load a page.</p>
+    </section>
+    <div id="divider" title="Drag to resize"></div>
+    <section id="detail">
+      <p id="detail-empty" class="muted empty">Select a request to see its details.</p>
+      <div id="detail-body" hidden></div>
+    </section>
+  </main>
+</section>
 
-  <div id="divider" title="Drag to resize"></div>
+<!-- ===== Intercept ===== -->
+<section id="view-intercept" class="view" hidden>
+  <div class="toolbar">
+    <label><input id="icpt-req" type="checkbox"> Intercept requests</label>
+    <label><input id="icpt-resp" type="checkbox"> Intercept responses</label>
+    <span id="icpt-info" class="muted"></span>
+    <span class="spacer"></span>
+    <span class="muted">Requests are held after being fully received, before they go upstream. Responses are held before they go to the client.</span>
+  </div>
+  <div class="split">
+    <aside id="icpt-list">
+      <table>
+        <thead><tr><th>#</th><th>Type</th><th>Method</th><th>URL / status</th><th>Auto-fwd</th></tr></thead>
+        <tbody id="icpt-rows"></tbody>
+      </table>
+      <p id="icpt-empty" class="muted empty">Nothing is held. Turn on interception above and load a page through the proxy.</p>
+    </aside>
+    <div id="icpt-editor" class="editor"><p class="muted empty">Select a held item to inspect and edit it.</p></div>
+  </div>
+</section>
 
-  <section id="detail">
-    <p id="detail-empty" class="muted empty">Select a request to see its details.</p>
-    <div id="detail-body" hidden>
-      <div id="detail-title"></div>
-      <div id="detail-error" class="error" hidden></div>
-      <div class="panes">
-        <div class="pane"><h2>Request</h2><div id="req"></div></div>
-        <div class="pane"><h2>Response</h2><div id="resp"></div></div>
-      </div>
-    </div>
-  </section>
-</main>
-<script src="app.js"></script>
+<!-- ===== Repeater ===== -->
+<section id="view-repeater" class="view" hidden>
+  <div class="split">
+    <aside id="rep-list">
+      <div id="rep-tabs"></div>
+      <p id="rep-empty" class="muted empty">Nothing here yet. In <b>History</b>, open a request and click <b>Send to Repeater</b>.</p>
+    </aside>
+    <div id="rep-main" class="editor"></div>
+  </div>
+</section>
+
+<script src="core.js"></script>
+<script src="history.js"></script>
+<script src="intercept.js"></script>
+<script src="repeater.js"></script>
 </body>
 </html>

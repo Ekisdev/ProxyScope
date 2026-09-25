@@ -32,6 +32,30 @@ type Store interface {
 	Clear(ctx context.Context) error
 }
 
+// Interceptor is the live-intercept queue (implemented by intercept.Manager).
+type Interceptor interface {
+	Settings() model.InterceptSettings
+	SetSettings(model.InterceptSettings)
+	Timeout() time.Duration
+	List() []model.PendingSummary
+	Get(id int64) (*model.Pending, error)
+	Resolve(id int64, res model.Resolution) error
+}
+
+// Repeater sends a request directly and stores the result (implemented by
+// repeater.Service).
+type Repeater interface {
+	Send(ctx context.Context, req *model.Request) (*model.Exchange, error)
+}
+
+// Deps are the collaborators of the UI server.
+type Deps struct {
+	Store       Store
+	Interceptor Interceptor
+	Repeater    Repeater
+	CAPEM       []byte // public CA certificate served at /ca.crt (nil disables it)
+}
+
 const (
 	defaultLimit = 500
 	maxLimit     = 1000
@@ -41,15 +65,16 @@ const (
 type Server struct {
 	addr   string
 	store  Store
+	icpt   Interceptor
+	rep    Repeater
 	caPEM  []byte // public CA certificate offered for download (never the key)
 	log    *slog.Logger
 	server *http.Server
 }
 
-// New creates the UI server. caPEM is the public root CA certificate served
-// at /ca.crt (nil disables the endpoint). It does not start listening.
-func New(addr string, store Store, caPEM []byte, log *slog.Logger) *Server {
-	s := &Server{addr: addr, store: store, caPEM: caPEM, log: log}
+// New creates the UI server. It does not start listening.
+func New(addr string, d Deps, log *slog.Logger) *Server {
+	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, caPEM: d.CAPEM, log: log}
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err) // embedded path is fixed at compile time
@@ -60,6 +85,13 @@ func New(addr string, store Store, caPEM []byte, log *slog.Logger) *Server {
 	mux.HandleFunc("GET /api/exchanges", s.handleList)
 	mux.HandleFunc("GET /api/exchanges/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/exchanges", s.handleClear)
+	mux.HandleFunc("GET /api/exchanges/{id}/repeater", s.handleRepeaterSeed)
+	mux.HandleFunc("POST /api/repeater/send", s.handleRepeaterSend)
+	mux.HandleFunc("GET /api/intercept", s.handleInterceptState)
+	mux.HandleFunc("PUT /api/intercept/settings", s.handleInterceptSettings)
+	mux.HandleFunc("GET /api/intercept/{id}", s.handleInterceptGet)
+	mux.HandleFunc("POST /api/intercept/{id}/forward", s.handleInterceptForward)
+	mux.HandleFunc("POST /api/intercept/{id}/drop", s.handleInterceptDrop)
 	s.server = &http.Server{
 		Handler:           s.guard(mux),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -215,6 +247,10 @@ type responseView struct {
 
 type detailView struct {
 	ID         int64         `json:"id"`
+	Source     string        `json:"source"`
+	ReqEdited  bool          `json:"reqEdited,omitempty"`
+	RespEdited bool          `json:"respEdited,omitempty"`
+	Note       string        `json:"note,omitempty"`
 	Timestamp  time.Time     `json:"timestamp"`
 	DurationMs float64       `json:"durationMs"`
 	URL        string        `json:"url"`
@@ -226,6 +262,10 @@ type detailView struct {
 func buildDetail(ex *model.Exchange) detailView {
 	d := detailView{
 		ID:         ex.ID,
+		Source:     sourceOf(ex),
+		ReqEdited:  ex.ReqEdited,
+		RespEdited: ex.RespEdited,
+		Note:       ex.Note,
 		Timestamp:  ex.Timestamp,
 		DurationMs: float64(ex.Duration) / float64(time.Millisecond),
 		URL:        ex.URL,
@@ -260,4 +300,11 @@ func headerList(h http.Header) []headerKV {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func sourceOf(ex *model.Exchange) string {
+	if ex.Source == "" {
+		return model.SourceProxy
+	}
+	return ex.Source
 }

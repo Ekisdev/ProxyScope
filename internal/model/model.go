@@ -38,8 +38,19 @@ type Exchange struct {
 	RespBodySize int64
 
 	// Error is a human readable description of what went wrong (upstream
-	// unreachable, timeout, ...). Empty on success.
+	// unreachable, timeout, dropped by intercept, ...). Empty on success.
 	Error string
+
+	// Source tells live-captured traffic (SourceProxy) from repeater sends
+	// (SourceRepeater). Empty is treated as SourceProxy.
+	Source string
+	// ReqEdited / RespEdited: the request/response was modified in the
+	// intercept queue; the stored copy is what was actually sent/delivered.
+	ReqEdited  bool
+	RespEdited bool
+	// Note is a non-error annotation, e.g. "auto-forwarded after 1m0s" or
+	// "response not intercepted: streaming response".
+	Note string
 }
 
 // ReqBodyTruncated reports whether ReqBody holds fewer bytes than were sent.
@@ -60,4 +71,13 @@ type Summary struct {
 	StatusCode   int       `json:"status"`
 	RespBodySize int64     `json:"size"`
 	Error        string    `json:"error,omitempty"`
+	Source       string    `json:"source"`         // SourceProxy or SourceRepeater
+	Edited       bool      `json:"edited"`         // modified via intercept
+	Note         string    `json:"note,omitempty"` // non-error annotation
 }
+
+// Values for Exchange.Source.
+const (
+	SourceProxy    = "proxy"    // captured live by the proxy
+	SourceRepeater = "repeater" // replayed from the repeater
+)

@@ -3,14 +3,17 @@
 // Plain HTTP requests are forwarded and recorded (Phase 1). HTTPS is handled
 // by terminating TLS on CONNECT tunnels with per-host certificates from a
 // local CA and relaying the decrypted HTTP/1.1 stream through the same
-// forwarding path (Phase 2, see tunnel.go). Protocol upgrades (WebSocket) are
-// answered with a readable 501.
+// forwarding path (Phase 2, see tunnel.go). Both share forward(), which also
+// hosts the two live-intercept pause points (Phase 3): after the request is
+// fully received and before it is sent upstream, and after the response is
+// fully received and before it is sent to the client. Protocol upgrades
+// (WebSocket) are answered with a readable 501.
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -18,11 +21,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"proxyscope/internal/model"
+	"proxyscope/internal/outbound"
 )
 
 // Sink receives every completed exchange. The storage layer implements it;
@@ -31,20 +36,22 @@ type Sink interface {
 	Save(ctx context.Context, ex *model.Exchange) error
 }
 
+// Interceptor is the live-intercept pause point, implemented by
+// intercept.Manager. A nil Interceptor means nothing is ever held. The Hold
+// methods block until the user resolves the message (or a timeout/disconnect
+// releases it), applying any edits to their argument in place.
+type Interceptor interface {
+	RequestEnabled() bool
+	ResponseEnabled() bool
+	HoldRequest(ctx context.Context, req *model.Request) model.Outcome
+	HoldResponse(ctx context.Context, req *model.Request, resp *model.Response) model.Outcome
+}
+
 // Config holds proxy engine settings.
 type Config struct {
-	Addr          string
-	MaxBodyBytes  int64
-	DialTimeout   time.Duration
-	HeaderTimeout time.Duration
-
-	// InsecureUpstream disables validation of upstream servers' TLS
-	// certificates. When false (default) an invalid upstream certificate
-	// produces a readable 502 for the client.
-	InsecureUpstream bool
-	// UpstreamRootCAs overrides the system roots used to validate upstream
-	// certificates (nil = system roots).
-	UpstreamRootCAs *x509.CertPool
+	Addr         string
+	MaxBodyBytes int64
+	Outbound     outbound.Config // dialing, timeouts and upstream TLS validation
 }
 
 // CertIssuer provides the certificates presented to clients on intercepted
@@ -58,8 +65,10 @@ type CertIssuer interface {
 // Proxy is an HTTP forward proxy that records the traffic it relays.
 type Proxy struct {
 	cfg       Config
+	out       outbound.Config
 	sink      Sink
 	issuer    CertIssuer
+	icpt      Interceptor // may be nil
 	log       *slog.Logger
 	transport *http.Transport // plain HTTP upstreams
 	server    *http.Server
@@ -74,10 +83,11 @@ type Proxy struct {
 	tunnels  map[*http.Server]struct{}
 }
 
-// New creates a Proxy. It does not start listening.
-func New(cfg Config, sink Sink, issuer CertIssuer, log *slog.Logger) *Proxy {
-	p := &Proxy{cfg: cfg, sink: sink, issuer: issuer, log: log, tunnels: map[*http.Server]struct{}{}}
-	p.transport = p.newTransport(nil)
+// New creates a Proxy. icpt may be nil (intercept unavailable). It does not
+// start listening.
+func New(cfg Config, sink Sink, issuer CertIssuer, icpt Interceptor, log *slog.Logger) *Proxy {
+	p := &Proxy{cfg: cfg, out: cfg.Outbound, sink: sink, issuer: issuer, icpt: icpt, log: log, tunnels: map[*http.Server]struct{}{}}
+	p.transport = p.out.Transport()
 	p.server = &http.Server{
 		Handler:           p,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -113,23 +123,6 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// newTransport builds an upstream transport. tlsCfg is used for https targets.
-func (p *Proxy) newTransport(tlsCfg *tls.Config) *http.Transport {
-	return &http.Transport{
-		// Never use environment proxies (HTTP_PROXY): we are the proxy.
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: p.cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
-		ResponseHeaderTimeout: p.cfg.HeaderTimeout,
-		TLSHandshakeTimeout:   p.cfg.DialTimeout,
-		TLSClientConfig:       tlsCfg, // non-nil also keeps upstream on HTTP/1.1
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   16,
-		// Forward Accept-Encoding untouched and never decompress, so the
-		// stored body is exactly what was on the wire.
-		DisableCompression: true,
-	}
-}
-
 // ServeHTTP implements http.Handler.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -152,11 +145,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // forward relays one request to the target server using tr and records the
-// exchange. r.URL must be absolute (http:// or https://).
+// exchange. r.URL must be absolute (http:// or https://). This is the single
+// code path for plain HTTP and decrypted HTTPS, and it hosts both intercept
+// pause points; a paused request blocks only this request's own goroutine, so
+// other requests are never held up.
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transport) {
 	start := time.Now()
 	ex := &model.Exchange{
 		Timestamp:  start,
+		Source:     model.SourceProxy,
 		Method:     r.Method,
 		URL:        r.URL.String(),
 		Host:       r.URL.Host,
@@ -164,16 +161,90 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 		Proto:      r.Proto,
 		ReqHeaders: r.Header.Clone(),
 	}
-	reqCap := newCapture(p.cfg.MaxBodyBytes)
-	respCap := newCapture(p.cfg.MaxBodyBytes)
+	reqCap := outbound.NewCapture(p.cfg.MaxBodyBytes)
+	respCap := outbound.NewCapture(p.cfg.MaxBodyBytes)
+	var notes []string
 	defer func() {
-		ex.ReqBody, ex.ReqBodySize = reqCap.buf, reqCap.total
-		ex.RespBody, ex.RespBodySize = respCap.buf, respCap.total
+		ex.ReqBody, ex.ReqBodySize = reqCap.Bytes(), reqCap.Total()
+		ex.RespBody, ex.RespBodySize = respCap.Bytes(), respCap.Total()
+		ex.Note = strings.Join(notes, "; ")
 		ex.Duration = time.Since(start)
 		p.save(ex)
 	}()
+	ctx := r.Context()
 
-	out, err := p.buildOutbound(r, reqCap)
+	// The request as the client sent it, with Host made explicit so it can be
+	// shown and edited like any other header.
+	req := &model.Request{Method: r.Method, URL: r.URL.String(), Header: r.Header.Clone()}
+	req.Header.Set("Host", r.Host)
+
+	var body io.Reader // client's request body, nil if there is none
+	if r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
+		body = r.Body
+	}
+
+	// --- Pause point 1: request fully received, nothing sent upstream yet.
+	held := false
+	if p.icpt != nil && p.icpt.RequestEnabled() {
+		var buf []byte
+		whole := true
+		if body != nil {
+			var err error
+			if buf, whole, err = outbound.ReadUpTo(body, p.cfg.MaxBodyBytes); err != nil {
+				ex.StatusCode, ex.Error = http.StatusBadRequest, "reading request body: "+err.Error()
+				plainError(w, ex.StatusCode, ex.Error)
+				return
+			}
+		}
+		if whole {
+			req.Body, held = buf, true
+		} else {
+			notes = append(notes, "request not intercepted: body larger than -max-body")
+			body = io.MultiReader(bytes.NewReader(buf), body)
+		}
+	}
+	origBase := r.URL.Scheme + "://" + r.URL.Host
+	if held {
+		oc := p.icpt.HoldRequest(ctx, req)
+		if oc.Note != "" {
+			notes = append(notes, oc.Note)
+		}
+		if ctx.Err() != nil {
+			ex.Error = "client disconnected while the request was held"
+			return
+		}
+		if oc.Verdict == model.VerdictDrop {
+			ex.StatusCode, ex.Error = http.StatusForbidden, "request dropped by intercept"
+			plainError(w, ex.StatusCode, "request dropped by ProxyScope intercept")
+			return
+		}
+		if oc.Edited {
+			ex.ReqEdited = true
+			recordEditedRequest(ex, req)
+		}
+	}
+
+	// A different scheme or host than the client asked for needs a transport
+	// with matching TLS settings (the caller's may be pinned to another name).
+	if held && ex.ReqEdited {
+		if u, err := url.Parse(req.URL); err == nil && u.Scheme+"://"+u.Host != origBase {
+			tr = p.out.Transport()
+			defer tr.CloseIdleConnections()
+		}
+	}
+
+	var outBody io.Reader
+	var outLen int64
+	switch {
+	case held:
+		if len(req.Body) > 0 {
+			reqCap.Write(req.Body)
+			outBody, outLen = bytes.NewReader(req.Body), int64(len(req.Body))
+		}
+	case body != nil:
+		outBody, outLen = io.TeeReader(body, reqCap), r.ContentLength // -1 = chunked
+	}
+	out, err := outbound.BuildRequest(ctx, req.Method, req.URL, req.Header, outBody, outLen)
 	if err != nil {
 		ex.StatusCode, ex.Error = http.StatusBadRequest, err.Error()
 		plainError(w, ex.StatusCode, "invalid request: "+err.Error())
@@ -182,7 +253,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 
 	resp, err := tr.RoundTrip(out)
 	if err != nil {
-		status, msg := classify(err, r.URL.Host)
+		status, msg := outbound.Classify(err, out.URL.Host)
 		ex.StatusCode, ex.Error = status, msg
 		if errors.Is(err, context.Canceled) {
 			// Client went away; nobody to answer.
@@ -190,7 +261,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 			p.log.Debug("client cancelled request", "url", ex.URL)
 			return
 		}
-		p.log.Warn("upstream request failed", "method", r.Method, "url", ex.URL, "err", err)
+		p.log.Warn("upstream request failed", "method", req.Method, "url", ex.URL, "err", err)
 		plainError(w, status, msg)
 		return
 	}
@@ -198,13 +269,75 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 
 	ex.StatusCode = resp.StatusCode
 	ex.RespHeaders = resp.Header.Clone()
+	deliver := &model.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone()}
+
+	// --- Pause point 2: response fully received, nothing sent to the client yet.
+	heldResp := false
+	if p.icpt != nil && p.icpt.ResponseEnabled() {
+		if reason := notHoldable(resp, p.cfg.MaxBodyBytes); reason != "" {
+			notes = append(notes, "response not intercepted: "+reason)
+		} else {
+			buf, whole, err := outbound.ReadUpTo(resp.Body, p.cfg.MaxBodyBytes)
+			switch {
+			case err != nil:
+				// Nothing has been sent to the client yet, so it can still get a clean error.
+				ex.StatusCode, ex.Error, ex.RespHeaders = http.StatusBadGateway, "reading response body from upstream: "+err.Error(), nil
+				if ctx.Err() != nil {
+					ex.StatusCode = 0
+					return
+				}
+				plainError(w, ex.StatusCode, ex.Error)
+				return
+			case whole:
+				deliver.Body, heldResp = buf, true
+			default:
+				notes = append(notes, "response not intercepted: body larger than -max-body")
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(buf), resp.Body), resp.Body}
+			}
+		}
+	}
+	if heldResp {
+		oc := p.icpt.HoldResponse(ctx, req, deliver)
+		if oc.Note != "" {
+			notes = append(notes, oc.Note)
+		}
+		if ctx.Err() != nil {
+			ex.StatusCode, ex.RespHeaders, ex.Error = 0, nil, "client disconnected while the response was held"
+			return
+		}
+		if oc.Verdict == model.VerdictDrop {
+			ex.StatusCode, ex.RespHeaders, ex.Error = http.StatusForbidden, nil, "response dropped by intercept"
+			plainError(w, ex.StatusCode, "response dropped by ProxyScope intercept")
+			return
+		}
+		ex.RespEdited = oc.Edited
+		ex.StatusCode, ex.RespHeaders = deliver.StatusCode, deliver.Header.Clone()
+	}
 
 	h := w.Header()
-	for k, vv := range resp.Header {
+	for k, vv := range deliver.Header {
 		h[k] = append([]string(nil), vv...)
 	}
-	removeHopByHop(h)
-	w.WriteHeader(resp.StatusCode)
+	outbound.RemoveHopByHop(h)
+	if heldResp {
+		// The body is fully buffered, so the length is known (and may have been edited).
+		canHaveBody := bodyAllowed(req.Method, deliver.StatusCode)
+		if canHaveBody {
+			h.Set("Content-Length", strconv.Itoa(len(deliver.Body)))
+		}
+		w.WriteHeader(deliver.StatusCode)
+		if canHaveBody {
+			respCap.Write(deliver.Body)
+			if _, err := w.Write(deliver.Body); err != nil {
+				ex.Error = "relaying response body: " + err.Error()
+			}
+		}
+		return
+	}
+	w.WriteHeader(deliver.StatusCode)
 
 	upstreamErr, err := copyBody(w, resp, respCap)
 	if err != nil {
@@ -219,33 +352,37 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transpo
 	}
 }
 
-// buildOutbound creates the request sent to the target server. The request
-// body is teed into reqCap as it streams.
-func (p *Proxy) buildOutbound(r *http.Request, reqCap *capture) (*http.Request, error) {
-	var body io.Reader
-	if r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
-		body = io.TeeReader(r.Body, reqCap)
+// recordEditedRequest makes the stored exchange describe what was actually sent.
+func recordEditedRequest(ex *model.Exchange, req *model.Request) {
+	ex.Method, ex.URL = req.Method, req.URL
+	if u, err := url.Parse(req.URL); err == nil {
+		ex.Host, ex.Path = u.Host, u.RequestURI()
 	}
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), body)
-	if err != nil {
-		return nil, err
+	ex.ReqHeaders = req.Header.Clone()
+	ex.ReqHeaders.Del("Host") // like live traffic: the host is shown separately
+	outbound.SyncContentLength(ex.ReqHeaders, len(req.Body))
+}
+
+// notHoldable says why a response must stream through instead of being held
+// for editing ("" = it can be held).
+func notHoldable(resp *http.Response, max int64) string {
+	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return "streaming response (text/event-stream)"
 	}
-	out.Host = r.Host
-	out.Header = r.Header.Clone()
-	removeHopByHop(out.Header)
-	if body != nil {
-		out.ContentLength = r.ContentLength // -1 means unknown: sent chunked
+	if resp.ContentLength > max {
+		return "body larger than -max-body"
 	}
-	if _, ok := out.Header["User-Agent"]; !ok {
-		// An explicit empty value stops net/http from injecting its own UA.
-		out.Header.Set("User-Agent", "")
-	}
-	return out, nil
+	return ""
+}
+
+// bodyAllowed reports whether a response to method with this status carries a body.
+func bodyAllowed(method string, status int) bool {
+	return method != http.MethodHead && status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 // copyBody streams resp.Body to w while recording it. The bool result tells
 // whether a returned error came from the upstream side (true) or the client (false).
-func copyBody(w http.ResponseWriter, resp *http.Response, rec *capture) (upstream bool, err error) {
+func copyBody(w http.ResponseWriter, resp *http.Response, rec *outbound.Capture) (upstream bool, err error) {
 	rc := http.NewResponseController(w)
 	flush := resp.ContentLength < 0 // unknown length: likely streaming, don't buffer
 	buf := make([]byte, 32*1024)
@@ -298,35 +435,6 @@ func (p *Proxy) isSelfAddr(host, port string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
-}
-
-// classify maps a transport error to an HTTP status and a readable message.
-func classify(err error, host string) (int, string) {
-	var (
-		netErr  net.Error
-		dnsErr  *net.DNSError
-		opErr   *net.OpError
-		certErr *tls.CertificateVerificationError
-		recErr  tls.RecordHeaderError
-	)
-	// Deliberately no syscall.ECONNREFUSED check: errno values differ between
-	// Windows and Linux, so the dial error text is used instead.
-	switch {
-	case errors.Is(err, context.Canceled):
-		return 0, "client closed the connection"
-	case errors.As(err, &certErr):
-		return http.StatusBadGateway, fmt.Sprintf("the certificate presented by %s failed validation: %v (start proxyscope with -insecure-upstream to accept invalid upstream certificates)", host, strings.TrimRight(certErr.Err.Error(), ": "))
-	case errors.As(err, &recErr):
-		return http.StatusBadGateway, fmt.Sprintf("%s does not speak TLS on this port", host)
-	case errors.As(err, &dnsErr):
-		return http.StatusBadGateway, fmt.Sprintf("cannot resolve host %q: %s", dnsErr.Name, dnsErr.Err)
-	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
-		return http.StatusGatewayTimeout, fmt.Sprintf("timed out talking to %s: %v", host, err)
-	case errors.As(err, &opErr) && opErr.Op == "dial":
-		return http.StatusBadGateway, fmt.Sprintf("could not connect to %s: %v", host, opErr.Err)
-	default:
-		return http.StatusBadGateway, fmt.Sprintf("error talking to %s: %v", host, err)
-	}
 }
 
 func plainError(w http.ResponseWriter, status int, msg string) {

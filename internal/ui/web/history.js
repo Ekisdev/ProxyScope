@@ -1,50 +1,43 @@
-// proxyscope UI. Polls /api/exchanges?after=<lastId> once a second.
-// All captured data is untrusted: only textContent is ever used to render it.
+// History view: polls /api/exchanges?after=<lastId> once a second.
 (() => {
   'use strict';
-  const $ = (id) => document.getElementById(id);
-  const rowsEl = $('rows'), filterEl = $('filter'), connEl = $('conn');
+  const { $, el, fmtSize, fmtTime, statusClass, api, renderExchange, setConn } = window.PS;
+  const rowsEl = $('rows'), filterEl = $('filter');
   const POLL_MS = 1000;
 
   let lastId = 0;
   let paused = false;
   let selectedId = null;
-  const items = new Map(); // id -> {summary, tr}
-
-  const el = (tag, text, cls) => {
-    const e = document.createElement(tag);
-    if (text != null) e.textContent = text;
-    if (cls) e.className = cls;
-    return e;
-  };
-
-  const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
-  const fmtTime = (iso) => new Date(iso).toLocaleTimeString([], { hour12: false });
-  const statusClass = (s) => 's' + Math.floor(s / 100);
-
-  async function api(path, opts = {}) {
-    const res = await fetch(path, { ...opts, headers: { 'X-Requested-With': 'proxyscope' } });
-    if (!res.ok) throw new Error(res.status + ' ' + (await res.text()).trim());
-    return res.status === 204 ? null : res.json();
-  }
+  const items = new Map(); // id -> {s, tr}
 
   // ---- list ----
   function matches(s, q) {
+    if ($('hide-replayed').checked && s.source === 'repeater') return false;
     if (!q) return true;
     return [s.method, s.url, s.path, String(s.status)].some((v) => v.toLowerCase().includes(q));
   }
 
+  function flagsCell(s) {
+    const td = el('td', null, 'flags');
+    const add = (txt, cls, title) => { const b = el('span', txt, 'flag ' + cls); b.title = title; td.appendChild(b); };
+    if (s.source === 'repeater') add('R', 'flag-r', 'Replayed from the repeater');
+    if (s.edited) add('E', 'flag-e', 'Edited in the intercept queue');
+    if (s.note) add('N', 'flag-n', s.note);
+    return td;
+  }
+
   function makeRow(s) {
     const tr = document.createElement('tr');
-    const status = s.status || 'ERR';
+    if (s.source === 'repeater') tr.classList.add('replayed');
     const host = s.url.startsWith('https://') ? 'https://' + s.host : s.host; // mark TLS rows
-    const cells = [s.id, fmtTime(s.timestamp), s.method, host, s.path, status, fmtSize(s.size), s.durationMs.toFixed(1)];
+    const cells = [s.id, fmtTime(s.timestamp), s.method, host, s.path, s.status || 'ERR', fmtSize(s.size), s.durationMs.toFixed(1)];
     cells.forEach((v, i) => {
       const td = el('td', v);
       td.title = String(v);
       if (i === 5) td.className = statusClass(s.status);
       tr.appendChild(td);
     });
+    tr.appendChild(flagsCell(s));
     tr.addEventListener('click', () => select(s.id));
     return tr;
   }
@@ -70,14 +63,19 @@
     $('empty').hidden = items.size > 0;
   }
 
+  function refilter() {
+    const q = filterEl.value.trim().toLowerCase();
+    items.forEach((it) => { it.tr.hidden = !matches(it.s, q); });
+    updateCount();
+  }
+
   async function poll() {
     if (!paused) {
       try {
         addRows(await api('/api/exchanges?after=' + lastId));
-        connEl.className = 'conn ok';
+        setConn(true);
       } catch (e) {
-        connEl.className = 'conn bad';
-        connEl.title = String(e);
+        setConn(false, e.message);
       }
     }
     setTimeout(poll, POLL_MS);
@@ -88,7 +86,7 @@
     selectedId = id;
     items.forEach((it, k) => it.tr.classList.toggle('sel', k === id));
     try {
-      renderDetail(await api('/api/exchanges/' + id));
+      showDetail(await api('/api/exchanges/' + id));
     } catch (e) {
       $('detail-empty').hidden = false;
       $('detail-empty').textContent = 'Failed to load request: ' + e.message;
@@ -96,57 +94,24 @@
     }
   }
 
-  function headersBlock(startLine, headers) {
-    const pre = el('pre', null, 'head');
-    pre.appendChild(el('b', startLine));
-    for (const h of headers) pre.appendChild(document.createTextNode('\n' + h.name + ': ' + h.value));
-    return pre;
-  }
-
-  function bodyBlock(b) {
-    const frag = document.createDocumentFragment();
-    if (b.size === 0) {
-      frag.appendChild(el('p', 'No body.', 'note'));
-      return frag;
-    }
-    const notes = [fmtSize(b.size)];
-    if (b.decodedFrom) notes.push('decoded from ' + b.decodedFrom);
-    if (b.encoding === 'hex') notes.push('binary, shown as hex dump');
-    if (b.truncated) notes.push('TRUNCATED: only ' + fmtSize(b.stored) + ' stored');
-    if (b.clipped) notes.push('display clipped');
-    frag.appendChild(el('p', 'Body — ' + notes.join(' · '), 'note'));
-    frag.appendChild(el('pre', b.content));
-    return frag;
-  }
-
-  function renderDetail(d) {
+  function showDetail(d) {
     $('detail-empty').hidden = true;
-    $('detail-body').hidden = false;
-    $('detail-title').textContent = '#' + d.id + '  ' + d.request.method + ' ' + d.url;
-    const err = $('detail-error');
-    err.hidden = !d.error;
-    err.textContent = d.error || '';
-
-    const req = $('req'), resp = $('resp');
-    req.replaceChildren(
-      headersBlock(d.request.method + ' ' + d.request.path + ' ' + d.request.proto + '\nHost: ' + d.request.host, d.request.headers),
-      bodyBlock(d.request.body));
-
-    if (d.response) {
-      resp.replaceChildren(
-        headersBlock('HTTP ' + d.response.status + ' ' + d.response.statusText, d.response.headers),
-        bodyBlock(d.response.body));
-    } else {
-      resp.replaceChildren(el('p', 'No response was produced.', 'note'));
-    }
+    const box = $('detail-body');
+    box.hidden = false;
+    box.replaceChildren(renderExchange(d));
+    // "Send to Repeater" sits in the title row.
+    const btn = el('button', 'Send to Repeater', 'primary');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try { await window.PS.repeater.openFromExchange(d.id); } catch (e) { alert('Send to Repeater failed: ' + e.message); }
+      btn.disabled = false;
+    });
+    box.querySelector('.detail-title').appendChild(btn);
   }
 
   // ---- controls ----
-  filterEl.addEventListener('input', () => {
-    const q = filterEl.value.trim().toLowerCase();
-    items.forEach((it) => { it.tr.hidden = !matches(it.s, q); });
-    updateCount();
-  });
+  filterEl.addEventListener('input', refilter);
+  $('hide-replayed').addEventListener('change', refilter);
 
   $('pause').addEventListener('click', (e) => {
     paused = !paused;

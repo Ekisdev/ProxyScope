@@ -12,12 +12,13 @@ import (
 
 // Config holds every user-tunable setting.
 type Config struct {
-	ProxyAddr     string        // listen address of the intercepting proxy
-	UIAddr        string        // listen address of the web UI
-	DBPath        string        // SQLite database file
-	MaxBodyBytes  int64         // max bytes of each body kept in the database
-	DialTimeout   time.Duration // connect timeout towards the target server
-	HeaderTimeout time.Duration // wait for response headers from the target
+	ProxyAddr        string        // listen address of the intercepting proxy
+	UIAddr           string        // listen address of the web UI
+	DBPath           string        // SQLite database file
+	MaxBodyBytes     int64         // max bytes of each body kept in the database
+	DialTimeout      time.Duration // connect timeout towards the target server
+	HeaderTimeout    time.Duration // wait for response headers from the target
+	InterceptTimeout time.Duration // auto-forward a held request/response after this long (0 = never)
 
 	CADir            string // directory holding the MITM root CA (ca.crt, ca.key)
 	ExportCA         string // if set: write the public CA certificate here and exit
@@ -28,13 +29,14 @@ type Config struct {
 // only: captured traffic is sensitive, so exposing it must be an explicit choice.
 func Default() Config {
 	return Config{
-		ProxyAddr:     "127.0.0.1:8080",
-		UIAddr:        "127.0.0.1:8081",
-		DBPath:        "proxyscope.db",
-		MaxBodyBytes:  10 << 20,
-		DialTimeout:   10 * time.Second,
-		HeaderTimeout: 60 * time.Second,
-		CADir:         defaultCADir(),
+		ProxyAddr:        "127.0.0.1:8080",
+		UIAddr:           "127.0.0.1:8081",
+		DBPath:           "proxyscope.db",
+		MaxBodyBytes:     10 << 20,
+		DialTimeout:      10 * time.Second,
+		HeaderTimeout:    60 * time.Second,
+		InterceptTimeout: 60 * time.Second,
+		CADir:            defaultCADir(),
 	}
 }
 
@@ -61,6 +63,7 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.Int64Var(&cfg.MaxBodyBytes, "max-body", cfg.MaxBodyBytes, "max bytes stored per request/response body (larger bodies are still forwarded in full)")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "timeout for connecting to the target server")
 	fs.DurationVar(&cfg.HeaderTimeout, "header-timeout", cfg.HeaderTimeout, "timeout waiting for the target's response headers")
+	fs.DurationVar(&cfg.InterceptTimeout, "intercept-timeout", cfg.InterceptTimeout, "auto-forward a held (intercepted) request or response unmodified after this long; 0 = wait until resolved or the client disconnects")
 	fs.StringVar(&cfg.CADir, "ca-dir", cfg.CADir, "directory of the MITM root CA (ca.crt + ca.key); generated on first run")
 	fs.StringVar(&cfg.ExportCA, "export-ca", "", "write the public CA certificate to this file (PEM) and exit")
 	fs.BoolVar(&cfg.InsecureUpstream, "insecure-upstream", false, "do NOT validate upstream servers' TLS certificates (invalid/expired/self-signed are accepted)")
@@ -72,6 +75,9 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	}
 	if cfg.MaxBodyBytes < 0 {
 		return cfg, fmt.Errorf("-max-body must be >= 0")
+	}
+	if cfg.InterceptTimeout < 0 {
+		return cfg, fmt.Errorf("-intercept-timeout must be >= 0")
 	}
 	if cfg.CADir == "" {
 		return cfg, fmt.Errorf("cannot determine the user config directory; pass -ca-dir")

@@ -46,7 +46,7 @@ func (fakeStore) Get(context.Context, int64) (*model.Exchange, error) { return n
 func (fakeStore) Clear(context.Context) error                         { return nil }
 
 func TestGuardAndRoutes(t *testing.T) {
-	s := New("127.0.0.1:0", fakeStore{}, []byte("CERT"), slog.New(slog.DiscardHandler))
+	s := New("127.0.0.1:0", Deps{Store: fakeStore{}, CAPEM: []byte("CERT")}, slog.New(slog.DiscardHandler))
 	h := s.server.Handler
 	do := func(method, path, host string, hdr map[string]string) int {
 		r := httptest.NewRequest(method, path, nil)
