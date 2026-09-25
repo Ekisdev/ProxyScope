@@ -31,13 +31,14 @@
   // ---- list ----
   function matches(s, q) {
     if (!q) return true;
-    return [s.method, s.host, s.path, String(s.status)].some((v) => v.toLowerCase().includes(q));
+    return [s.method, s.url, s.path, String(s.status)].some((v) => v.toLowerCase().includes(q));
   }
 
   function makeRow(s) {
     const tr = document.createElement('tr');
     const status = s.status || 'ERR';
-    const cells = [s.id, fmtTime(s.timestamp), s.method, s.host, s.path, status, fmtSize(s.size), s.durationMs.toFixed(1)];
+    const host = s.url.startsWith('https://') ? 'https://' + s.host : s.host; // mark TLS rows
+    const cells = [s.id, fmtTime(s.timestamp), s.method, host, s.path, status, fmtSize(s.size), s.durationMs.toFixed(1)];
     cells.forEach((v, i) => {
       const td = el('td', v);
       td.title = String(v);

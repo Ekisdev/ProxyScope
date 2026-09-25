@@ -46,7 +46,7 @@ func (fakeStore) Get(context.Context, int64) (*model.Exchange, error) { return n
 func (fakeStore) Clear(context.Context) error                         { return nil }
 
 func TestGuardAndRoutes(t *testing.T) {
-	s := New("127.0.0.1:0", fakeStore{}, slog.New(slog.DiscardHandler))
+	s := New("127.0.0.1:0", fakeStore{}, []byte("CERT"), slog.New(slog.DiscardHandler))
 	h := s.server.Handler
 	do := func(method, path, host string, hdr map[string]string) int {
 		r := httptest.NewRequest(method, path, nil)
@@ -62,6 +62,9 @@ func TestGuardAndRoutes(t *testing.T) {
 
 	if c := do("GET", "/", "127.0.0.1:8081", nil); c != 200 {
 		t.Errorf("index = %d", c)
+	}
+	if c := do("GET", "/ca.crt", "127.0.0.1:8081", nil); c != 200 {
+		t.Errorf("ca.crt = %d", c)
 	}
 	if c := do("GET", "/api/exchanges", "127.0.0.1:8081", nil); c != 200 {
 		t.Errorf("list = %d", c)

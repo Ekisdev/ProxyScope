@@ -14,6 +14,8 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 input[type=search] { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; width: 280px; }
 button { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; cursor: pointer; }
 button:hover { border-color: var(--accent); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
 .conn { font-size: 12px; } .conn.ok { color: var(--ok); } .conn.bad { color: var(--err); }
 
 main { flex: 1; display: flex; flex-direction: column; min-height: 0; }

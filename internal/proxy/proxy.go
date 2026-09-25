@@ -1,11 +1,16 @@
-// Package proxy implements the plain-HTTP intercepting proxy engine.
+// Package proxy implements the intercepting proxy engine.
 //
-// Phase 1 scope: HTTP/1.1 forward proxying with capture of every exchange.
-// HTTPS (CONNECT) and protocol upgrades are answered with a readable 501.
+// Plain HTTP requests are forwarded and recorded (Phase 1). HTTPS is handled
+// by terminating TLS on CONNECT tunnels with per-host certificates from a
+// local CA and relaying the decrypted HTTP/1.1 stream through the same
+// forwarding path (Phase 2, see tunnel.go). Protocol upgrades (WebSocket) are
+// answered with a readable 501.
 package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"proxyscope/internal/model"
@@ -31,36 +37,47 @@ type Config struct {
 	MaxBodyBytes  int64
 	DialTimeout   time.Duration
 	HeaderTimeout time.Duration
+
+	// InsecureUpstream disables validation of upstream servers' TLS
+	// certificates. When false (default) an invalid upstream certificate
+	// produces a readable 502 for the client.
+	InsecureUpstream bool
+	// UpstreamRootCAs overrides the system roots used to validate upstream
+	// certificates (nil = system roots).
+	UpstreamRootCAs *x509.CertPool
+}
+
+// CertIssuer provides the certificates presented to clients on intercepted
+// TLS connections. Implemented by ca.Authority.
+type CertIssuer interface {
+	// CertificateFor returns a certificate valid for name (DNS name or IP),
+	// or an error if name is not acceptable.
+	CertificateFor(name string) (*tls.Certificate, error)
 }
 
 // Proxy is an HTTP forward proxy that records the traffic it relays.
 type Proxy struct {
 	cfg       Config
 	sink      Sink
+	issuer    CertIssuer
 	log       *slog.Logger
-	transport *http.Transport
+	transport *http.Transport // plain HTTP upstreams
 	server    *http.Server
 
 	// Set in ListenAndServe before serving; used for self-loop detection.
 	selfHost string
 	selfPort string
+
+	// Active TLS tunnels, so Shutdown can close them (hijacked connections
+	// are not tracked by http.Server).
+	tunnelMu sync.Mutex
+	tunnels  map[*http.Server]struct{}
 }
 
 // New creates a Proxy. It does not start listening.
-func New(cfg Config, sink Sink, log *slog.Logger) *Proxy {
-	p := &Proxy{cfg: cfg, sink: sink, log: log}
-	p.transport = &http.Transport{
-		// Never use environment proxies (HTTP_PROXY): we are the proxy.
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
-		ResponseHeaderTimeout: cfg.HeaderTimeout,
-		TLSHandshakeTimeout:   cfg.DialTimeout,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   16,
-		// Forward Accept-Encoding untouched and never decompress, so the
-		// stored body is exactly what was on the wire.
-		DisableCompression: true,
-	}
+func New(cfg Config, sink Sink, issuer CertIssuer, log *slog.Logger) *Proxy {
+	p := &Proxy{cfg: cfg, sink: sink, issuer: issuer, log: log, tunnels: map[*http.Server]struct{}{}}
+	p.transport = p.newTransport(nil)
 	p.server = &http.Server{
 		Handler:           p,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -88,50 +105,55 @@ func (p *Proxy) ListenAndServe() error {
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	err := p.server.Shutdown(ctx)
 	p.transport.CloseIdleConnections()
+	p.tunnelMu.Lock()
+	for srv := range p.tunnels {
+		srv.Close()
+	}
+	p.tunnelMu.Unlock()
 	return err
+}
+
+// newTransport builds an upstream transport. tlsCfg is used for https targets.
+func (p *Proxy) newTransport(tlsCfg *tls.Config) *http.Transport {
+	return &http.Transport{
+		// Never use environment proxies (HTTP_PROXY): we are the proxy.
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: p.cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ResponseHeaderTimeout: p.cfg.HeaderTimeout,
+		TLSHandshakeTimeout:   p.cfg.DialTimeout,
+		TLSClientConfig:       tlsCfg, // non-nil also keeps upstream on HTTP/1.1
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   16,
+		// Forward Accept-Encoding untouched and never decompress, so the
+		// stored body is exactly what was on the wire.
+		DisableCompression: true,
+	}
 }
 
 // ServeHTTP implements http.Handler.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodConnect:
-		p.rejectConnect(w, r)
+		p.handleConnect(w, r)
 	case !r.URL.IsAbs() || r.URL.Host == "":
 		plainError(w, http.StatusBadRequest,
 			"proxyscope is an HTTP proxy, not a web server.\n"+
-				"Configure your browser/client to use it as an HTTP proxy and request an http:// URL.")
+				"Configure your browser/client to use it as an HTTP proxy and request an http:// or https:// URL.")
 	case r.URL.Scheme != "http":
-		plainError(w, http.StatusBadRequest, fmt.Sprintf("unsupported scheme %q: only http is supported in Phase 1", r.URL.Scheme))
+		// https:// requests must arrive through a CONNECT tunnel.
+		plainError(w, http.StatusBadRequest, fmt.Sprintf("unsupported scheme %q in a plain proxy request; HTTPS clients must use CONNECT", r.URL.Scheme))
 	case p.isSelf(r.URL):
 		plainError(w, http.StatusLoopDetected, "request targets the proxy itself; refusing to forward it to avoid a loop")
 	case isUpgrade(r):
-		plainError(w, http.StatusNotImplemented, "protocol upgrades (e.g. WebSocket) are not supported in Phase 1")
+		plainError(w, http.StatusNotImplemented, "protocol upgrades (e.g. WebSocket) are not supported")
 	default:
-		p.forward(w, r)
+		p.forward(w, r, p.transport)
 	}
 }
 
-// rejectConnect answers HTTPS tunnel requests. TLS interception is Phase 2;
-// the attempt is still recorded so it shows up in the history.
-func (p *Proxy) rejectConnect(w http.ResponseWriter, r *http.Request) {
-	const msg = "HTTPS (CONNECT) is not supported yet: proxyscope Phase 1 handles plain HTTP only"
-	ex := &model.Exchange{
-		Timestamp:  time.Now(),
-		Method:     r.Method,
-		URL:        r.Host,
-		Host:       r.Host,
-		Path:       "",
-		Proto:      r.Proto,
-		ReqHeaders: r.Header.Clone(),
-		StatusCode: http.StatusNotImplemented,
-		Error:      msg,
-	}
-	plainError(w, http.StatusNotImplemented, msg)
-	p.save(ex)
-}
-
-// forward relays one request to the target server and records the exchange.
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
+// forward relays one request to the target server using tr and records the
+// exchange. r.URL must be absolute (http:// or https://).
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, tr *http.Transport) {
 	start := time.Now()
 	ex := &model.Exchange{
 		Timestamp:  start,
@@ -158,7 +180,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := p.transport.RoundTrip(out)
+	resp, err := tr.RoundTrip(out)
 	if err != nil {
 		status, msg := classify(err, r.URL.Host)
 		ex.StatusCode, ex.Error = status, msg
@@ -264,10 +286,13 @@ func (p *Proxy) isSelf(u *url.URL) bool {
 	if port == "" {
 		port = "80"
 	}
+	return p.isSelfAddr(u.Hostname(), port)
+}
+
+func (p *Proxy) isSelfAddr(host, port string) bool {
 	if port != p.selfPort {
 		return false
 	}
-	host := u.Hostname()
 	if strings.EqualFold(host, "localhost") || host == p.selfHost {
 		return true
 	}
@@ -278,15 +303,21 @@ func (p *Proxy) isSelf(u *url.URL) bool {
 // classify maps a transport error to an HTTP status and a readable message.
 func classify(err error, host string) (int, string) {
 	var (
-		netErr net.Error
-		dnsErr *net.DNSError
-		opErr  *net.OpError
+		netErr  net.Error
+		dnsErr  *net.DNSError
+		opErr   *net.OpError
+		certErr *tls.CertificateVerificationError
+		recErr  tls.RecordHeaderError
 	)
 	// Deliberately no syscall.ECONNREFUSED check: errno values differ between
 	// Windows and Linux, so the dial error text is used instead.
 	switch {
 	case errors.Is(err, context.Canceled):
 		return 0, "client closed the connection"
+	case errors.As(err, &certErr):
+		return http.StatusBadGateway, fmt.Sprintf("the certificate presented by %s failed validation: %v (start proxyscope with -insecure-upstream to accept invalid upstream certificates)", host, strings.TrimRight(certErr.Err.Error(), ": "))
+	case errors.As(err, &recErr):
+		return http.StatusBadGateway, fmt.Sprintf("%s does not speak TLS on this port", host)
 	case errors.As(err, &dnsErr):
 		return http.StatusBadGateway, fmt.Sprintf("cannot resolve host %q: %s", dnsErr.Name, dnsErr.Err)
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"proxyscope/internal/ca"
 	"proxyscope/internal/model"
 )
 
@@ -42,18 +43,28 @@ func (m *memSink) last(t *testing.T) *model.Exchange {
 // that uses it, plus the sink that records exchanges.
 func newProxyClient(t *testing.T, maxBody int64) (*http.Client, *memSink) {
 	t.Helper()
+	u, sink, _ := startProxy(t, Config{MaxBodyBytes: maxBody, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second})
+	return &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(u)},
+		Timeout:   5 * time.Second,
+	}, sink
+}
+
+// startProxy serves a Proxy (with a fresh temporary CA) on a random port.
+func startProxy(t *testing.T, cfg Config) (*url.URL, *memSink, *ca.Authority) {
+	t.Helper()
+	authority, _, err := ca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	sink := &memSink{}
-	p := New(Config{Addr: "127.0.0.1:0", MaxBodyBytes: maxBody, DialTimeout: time.Second, HeaderTimeout: 2 * time.Second},
-		sink, slog.New(slog.DiscardHandler))
+	p := New(cfg, sink, authority, slog.New(slog.DiscardHandler))
 	srv := httptest.NewServer(p)
-	t.Cleanup(srv.Close)
+	t.Cleanup(func() { p.Shutdown(context.Background()); srv.Close() })
 	u, _ := url.Parse(srv.URL)
 	// httptest listens on a random port, so the self-loop check must know it.
 	p.selfHost, p.selfPort, _ = net.SplitHostPort(u.Host)
-	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(u), DisableKeepAlives: false},
-		Timeout:   5 * time.Second,
-	}, sink
+	return u, sink, authority
 }
 
 func TestForwardAndCapture(t *testing.T) {
@@ -159,12 +170,7 @@ func TestHeaderTimeoutReturns504(t *testing.T) {
 		time.Sleep(600 * time.Millisecond)
 	}))
 	defer up.Close()
-	sink := &memSink{}
-	p := New(Config{MaxBodyBytes: 1 << 10, DialTimeout: time.Second, HeaderTimeout: 100 * time.Millisecond}, sink, slog.New(slog.DiscardHandler))
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-	u, _ := url.Parse(srv.URL)
-	p.selfHost, p.selfPort, _ = net.SplitHostPort(u.Host)
+	u, _, _ := startProxy(t, Config{MaxBodyBytes: 1 << 10, DialTimeout: time.Second, HeaderTimeout: 100 * time.Millisecond})
 	c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}, Timeout: 5 * time.Second}
 
 	resp, err := c.Get(up.URL)
@@ -174,17 +180,6 @@ func TestHeaderTimeoutReturns504(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504", resp.StatusCode)
-	}
-}
-
-func TestConnectIsRejectedAndRecorded(t *testing.T) {
-	c, sink := newProxyClient(t, 1<<10)
-	_, err := c.Get("https://example.invalid/") // client issues CONNECT
-	if err == nil {
-		t.Fatal("expected error: CONNECT is unsupported")
-	}
-	if ex := sink.last(t); ex.Method != "CONNECT" || ex.StatusCode != 501 {
-		t.Fatalf("bad exchange: %+v", ex)
 	}
 }
 

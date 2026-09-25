@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -16,6 +18,10 @@ type Config struct {
 	MaxBodyBytes  int64         // max bytes of each body kept in the database
 	DialTimeout   time.Duration // connect timeout towards the target server
 	HeaderTimeout time.Duration // wait for response headers from the target
+
+	CADir            string // directory holding the MITM root CA (ca.crt, ca.key)
+	ExportCA         string // if set: write the public CA certificate here and exit
+	InsecureUpstream bool   // skip validation of upstream TLS certificates
 }
 
 // Default returns the default configuration. Both listeners bind to loopback
@@ -28,7 +34,19 @@ func Default() Config {
 		MaxBodyBytes:  10 << 20,
 		DialTimeout:   10 * time.Second,
 		HeaderTimeout: 60 * time.Second,
+		CADir:         defaultCADir(),
 	}
+}
+
+// defaultCADir returns <user config dir>/ekisde.dev/Proxy/ca:
+// %AppData%\ekisde.dev\Proxy\ca on Windows, ~/.config/ekisde.dev/Proxy/ca on
+// Linux (honoring XDG_CONFIG_HOME). Empty if the config dir is unknown.
+func defaultCADir() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(base, "ekisde.dev", "Proxy", "ca")
 }
 
 // Parse builds a Config from command-line arguments (without the program
@@ -43,6 +61,9 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.Int64Var(&cfg.MaxBodyBytes, "max-body", cfg.MaxBodyBytes, "max bytes stored per request/response body (larger bodies are still forwarded in full)")
 	fs.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "timeout for connecting to the target server")
 	fs.DurationVar(&cfg.HeaderTimeout, "header-timeout", cfg.HeaderTimeout, "timeout waiting for the target's response headers")
+	fs.StringVar(&cfg.CADir, "ca-dir", cfg.CADir, "directory of the MITM root CA (ca.crt + ca.key); generated on first run")
+	fs.StringVar(&cfg.ExportCA, "export-ca", "", "write the public CA certificate to this file (PEM) and exit")
+	fs.BoolVar(&cfg.InsecureUpstream, "insecure-upstream", false, "do NOT validate upstream servers' TLS certificates (invalid/expired/self-signed are accepted)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -51,6 +72,9 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	}
 	if cfg.MaxBodyBytes < 0 {
 		return cfg, fmt.Errorf("-max-body must be >= 0")
+	}
+	if cfg.CADir == "" {
+		return cfg, fmt.Errorf("cannot determine the user config directory; pass -ca-dir")
 	}
 	if cfg.ProxyAddr == cfg.UIAddr {
 		return cfg, fmt.Errorf("-proxy-addr and -ui-addr must differ")

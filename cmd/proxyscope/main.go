@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"proxyscope/internal/ca"
 	"proxyscope/internal/config"
 	"proxyscope/internal/proxy"
 	"proxyscope/internal/store"
@@ -36,6 +37,18 @@ func run() error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	if cfg.ExportCA != "" {
+		authority, _, err := ca.LoadOrCreate(cfg.CADir)
+		if err != nil {
+			return fmt.Errorf("root CA: %w", err)
+		}
+		if err := authority.ExportCert(cfg.ExportCA); err != nil {
+			return err
+		}
+		fmt.Printf("CA certificate written to %s\nSHA-256 fingerprint: %s\n", cfg.ExportCA, authority.Fingerprint())
+		return nil
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
@@ -43,13 +56,27 @@ func run() error {
 	defer st.Close()
 	log.Info("database opened", "path", cfg.DBPath)
 
+	authority, created, err := ca.LoadOrCreate(cfg.CADir)
+	if err != nil {
+		return fmt.Errorf("root CA: %w", err)
+	}
+	if created {
+		log.Info("generated a new root CA; install ca.crt in your trust store to intercept HTTPS (see README)")
+	}
+	// Only public information is logged: never the key.
+	log.Info("root CA loaded", "cert", authority.CertPath(), "sha256", authority.Fingerprint())
+
 	px := proxy.New(proxy.Config{
-		Addr:          cfg.ProxyAddr,
-		MaxBodyBytes:  cfg.MaxBodyBytes,
-		DialTimeout:   cfg.DialTimeout,
-		HeaderTimeout: cfg.HeaderTimeout,
-	}, st, log)
-	web := ui.New(cfg.UIAddr, st, log)
+		Addr:             cfg.ProxyAddr,
+		MaxBodyBytes:     cfg.MaxBodyBytes,
+		DialTimeout:      cfg.DialTimeout,
+		HeaderTimeout:    cfg.HeaderTimeout,
+		InsecureUpstream: cfg.InsecureUpstream,
+	}, st, authority, log)
+	if cfg.InsecureUpstream {
+		log.Warn("upstream TLS certificate validation is DISABLED (-insecure-upstream)")
+	}
+	web := ui.New(cfg.UIAddr, st, authority.CertPEM(), log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

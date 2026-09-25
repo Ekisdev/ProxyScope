@@ -41,19 +41,22 @@ const (
 type Server struct {
 	addr   string
 	store  Store
+	caPEM  []byte // public CA certificate offered for download (never the key)
 	log    *slog.Logger
 	server *http.Server
 }
 
-// New creates the UI server. It does not start listening.
-func New(addr string, store Store, log *slog.Logger) *Server {
-	s := &Server{addr: addr, store: store, log: log}
+// New creates the UI server. caPEM is the public root CA certificate served
+// at /ca.crt (nil disables the endpoint). It does not start listening.
+func New(addr string, store Store, caPEM []byte, log *slog.Logger) *Server {
+	s := &Server{addr: addr, store: store, caPEM: caPEM, log: log}
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err) // embedded path is fixed at compile time
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /", http.FileServerFS(web))
+	mux.HandleFunc("GET /ca.crt", s.handleCA)
 	mux.HandleFunc("GET /api/exchanges", s.handleList)
 	mux.HandleFunc("GET /api/exchanges/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/exchanges", s.handleClear)
@@ -97,6 +100,17 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleCA serves the public root CA certificate for installation in a trust store.
+func (s *Server) handleCA(w http.ResponseWriter, r *http.Request) {
+	if s.caPEM == nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+	w.Header().Set("Content-Disposition", `attachment; filename="proxyscope-ca.crt"`)
+	_, _ = w.Write(s.caPEM)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
