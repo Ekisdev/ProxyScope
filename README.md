@@ -78,6 +78,8 @@ go build -o proxyscope.exe ./cmd/proxyscope
 
 Or without building: `go run ./cmd/proxyscope`. Stop it with `Ctrl+C` (graceful shutdown on both OSes).
 
+**`windowsbuilder.bat`** (repo root) is a double-click alternative to the PowerShell commands above: it checks whether `go` is on `PATH`, and if not, asks `Y`/`N` whether to install it (via `winget`, falling back to downloading the latest installer from go.dev if `winget` isn't available) before building `proxyscope.exe` in the repo root. Answering `N` just closes without installing or building anything. Installing Go this way may prompt for Administrator permission (the official Go installer is a per-machine MSI); the script itself doesn't need to be run elevated if Go is already installed.
+
 On first run it generates the root CA (see below) and logs its path and SHA-256 fingerprint.
 
 ### Configuration
