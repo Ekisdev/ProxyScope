@@ -31,8 +31,10 @@ type Store interface {
 	Get(ctx context.Context, id int64) (*model.Exchange, error)
 	Clear(ctx context.Context) error
 
-	// Relay (Phase 5) session/chunk reads. target "" means every target.
-	ListRelaySessions(ctx context.Context, target string, limit int) ([]model.RelaySessionSummary, error)
+	// Relay (Phase 5) and sysCapture (Phase 6) session/chunk reads, sharing
+	// one table pair distinguished by source (see model.RelaySession.Source).
+	// source "" means every source; target "" means every target.
+	ListRelaySessions(ctx context.Context, source, target string, limit int) ([]model.RelaySessionSummary, error)
 	GetRelaySession(ctx context.Context, id int64) (*model.RelaySession, error)
 	ListRelayChunks(ctx context.Context, sessionID int64) ([]model.RelayChunk, error)
 }
@@ -79,6 +81,25 @@ type RelayStatus interface {
 	Resolve(id int64, res model.RelayResolution) error
 }
 
+// SysCaptureStatus is Phase 6's system-level (WinDivert) capture engine
+// status and live hold queue (implemented by sysCapture.Service). It has
+// one flat Settings pair (not per-target like RelayStatus) because there is
+// exactly one configured filter in this phase. Session/chunk history is
+// read through Store, sharing the same tables the relay's do (see
+// model.RelaySession.Source). Deps.SysCapture is nil when -syscapture was
+// not enabled at startup; every handler using it must handle that (see
+// ui/syscapture.go), reporting "not enabled" rather than panicking.
+type SysCaptureStatus interface {
+	Filter() string // the configured WinDivert filter expression
+	Elevated() bool // whether this process has the privileges WinDivertOpen requires
+	Timeout() time.Duration
+	Settings() model.RelaySettings
+	SetSettings(s model.RelaySettings)
+	List() []model.RelayPendingSummary
+	Get(id int64) (*model.RelayPending, error)
+	Resolve(id int64, res model.RelayResolution) error
+}
+
 // Deps are the collaborators of the UI server.
 type Deps struct {
 	Store       Store
@@ -86,7 +107,8 @@ type Deps struct {
 	Repeater    Repeater
 	Rules       Rules
 	Relay       RelayStatus
-	CAPEM       []byte // public CA certificate served at /ca.crt (nil disables it)
+	SysCapture  SysCaptureStatus // nil when -syscapture was not enabled (see SysCaptureStatus)
+	CAPEM       []byte           // public CA certificate served at /ca.crt (nil disables it)
 }
 
 const (
@@ -96,20 +118,21 @@ const (
 
 // Server is the web UI HTTP server.
 type Server struct {
-	addr   string
-	store  Store
-	icpt   Interceptor
-	rep    Repeater
-	rules  Rules
-	relay  RelayStatus
-	caPEM  []byte // public CA certificate offered for download (never the key)
-	log    *slog.Logger
-	server *http.Server
+	addr       string
+	store      Store
+	icpt       Interceptor
+	rep        Repeater
+	rules      Rules
+	relay      RelayStatus
+	sysCapture SysCaptureStatus // nil when -syscapture was not enabled
+	caPEM      []byte           // public CA certificate offered for download (never the key)
+	log        *slog.Logger
+	server     *http.Server
 }
 
 // New creates the UI server. It does not start listening.
 func New(addr string, d Deps, log *slog.Logger) *Server {
-	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, rules: d.Rules, relay: d.Relay, caPEM: d.CAPEM, log: log}
+	s := &Server{addr: addr, store: d.Store, icpt: d.Interceptor, rep: d.Repeater, rules: d.Rules, relay: d.Relay, sysCapture: d.SysCapture, caPEM: d.CAPEM, log: log}
 	web, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err) // embedded path is fixed at compile time
@@ -138,6 +161,13 @@ func New(addr string, d Deps, log *slog.Logger) *Server {
 	mux.HandleFunc("GET /api/relay/pending/{id}", s.handleRelayPendingGet)
 	mux.HandleFunc("POST /api/relay/pending/{id}/forward", s.handleRelayForward)
 	mux.HandleFunc("POST /api/relay/pending/{id}/drop", s.handleRelayDrop)
+	mux.HandleFunc("GET /api/syscapture", s.handleSysCaptureState)
+	mux.HandleFunc("PUT /api/syscapture/settings", s.handleSysCaptureSettings)
+	mux.HandleFunc("GET /api/syscapture/sessions", s.handleSysCaptureSessions)
+	mux.HandleFunc("GET /api/syscapture/sessions/{id}", s.handleSysCaptureSessionDetail)
+	mux.HandleFunc("GET /api/syscapture/pending/{id}", s.handleSysCapturePendingGet)
+	mux.HandleFunc("POST /api/syscapture/pending/{id}/forward", s.handleSysCaptureForward)
+	mux.HandleFunc("POST /api/syscapture/pending/{id}/drop", s.handleSysCaptureDrop)
 	s.server = &http.Server{
 		Handler:           s.guard(mux),
 		ReadHeaderTimeout: 10 * time.Second,

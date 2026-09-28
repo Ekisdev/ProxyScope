@@ -45,7 +45,7 @@ func (fakeStore) List(context.Context, int64, int) ([]model.Summary, error) {
 func (fakeStore) Get(context.Context, int64) (*model.Exchange, error) { return nil, model.ErrNotFound }
 func (fakeStore) Clear(context.Context) error                         { return nil }
 
-func (fakeStore) ListRelaySessions(context.Context, string, int) ([]model.RelaySessionSummary, error) {
+func (fakeStore) ListRelaySessions(context.Context, string, string, int) ([]model.RelaySessionSummary, error) {
 	return nil, nil
 }
 func (fakeStore) GetRelaySession(context.Context, int64) (*model.RelaySession, error) {

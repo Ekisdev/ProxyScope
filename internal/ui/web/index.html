@@ -15,6 +15,7 @@
     <button data-view="repeater">Repeater <span id="rbadge" class="badge quiet" hidden>0</span></button>
     <button data-view="rules">Rules</button>
     <button data-view="relay">Relay</button>
+    <button data-view="syscapture">System Capture</button>
   </nav>
   <span class="spacer"></span>
   <a id="ca" href="ca.crt" download="proxyscope-ca.crt" title="Public root CA certificate: install it in your OS/browser trust store to decrypt HTTPS">CA certificate</a>
@@ -128,11 +129,49 @@
   </div>
 </section>
 
+<!-- ===== System Capture (Phase 6, WinDivert, Windows only) ===== -->
+<section id="view-syscapture" class="view" hidden>
+  <p class="note warn">System-level capture can intercept and modify traffic from <b>any process on this system</b> matching the
+    configured filter, not just traffic pointed at ProxyScope. Only use it against your own traffic or systems you have explicit
+    authorization to test.</p>
+  <div id="sc-disabled" class="muted empty">
+    System-level capture is not enabled. Start ProxyScope with <code>-syscapture</code> and <code>-syscapture-filter</code>
+    (as Administrator, Windows only; see README) to use this tab.
+  </div>
+  <div id="sc-enabled" hidden>
+    <div class="toolbar">
+      <span id="sc-filter" class="muted"></span>
+      <span id="sc-elevated" class="muted"></span>
+      <span class="spacer"></span>
+      <label><input id="sc-up" type="checkbox"> intercept outbound</label>
+      <label><input id="sc-down" type="checkbox"> intercept inbound</label>
+    </div>
+    <div class="split">
+      <aside id="sc-list">
+        <h2>Held packets</h2>
+        <table>
+          <thead><tr><th>#</th><th>Dir</th><th>Session</th><th>Size</th><th>Auto-fwd</th></tr></thead>
+          <tbody id="sc-pending-rows"></tbody>
+        </table>
+        <p id="sc-pending-empty" class="muted empty">Nothing held. Turn on intercept above to pause matching packets.</p>
+        <h2>Sessions</h2>
+        <table>
+          <thead><tr><th>#</th><th>Proto</th><th>Local</th><th>Remote</th><th>Opened</th><th>Out</th><th>In</th><th>Status</th></tr></thead>
+          <tbody id="sc-session-rows"></tbody>
+        </table>
+        <p id="sc-sessions-empty" class="muted empty">No captured sessions yet.</p>
+      </aside>
+      <div id="sc-detail" class="editor"><p class="muted empty">Select a held packet or a session to inspect it.</p></div>
+    </div>
+  </div>
+</section>
+
 <script src="core.js"></script>
 <script src="history.js"></script>
 <script src="intercept.js"></script>
 <script src="repeater.js"></script>
 <script src="rules.js"></script>
 <script src="relay.js"></script>
+<script src="syscapture.js"></script>
 </body>
 </html>

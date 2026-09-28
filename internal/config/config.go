@@ -31,6 +31,15 @@ type Config struct {
 	RelayTargets        []RelayTarget // generic TCP/UDP relays; empty = the relay engine does nothing
 	RelayMaxCapture     int64         // max bytes stored per relay session per direction (still fully forwarded)
 	RelayUDPIdleTimeout time.Duration // evict a UDP relay session after this much inactivity
+
+	// System-level capture (Phase 6, Windows only via WinDivert): off by
+	// default and gated on its own flag, deliberately separate from the
+	// proxy/relay flags above, because unlike them it is not scoped to
+	// traffic explicitly pointed at ProxyScope (see README).
+	SysCapture            bool          // enable WinDivert-based system-level capture
+	SysCaptureFilter      string        // WinDivert filter expression (network layer); required if SysCapture is true
+	SysCaptureMaxCapture  int64         // max bytes stored per captured session per direction (still fully re-injected)
+	SysCaptureIdleTimeout time.Duration // evict a captured session after this much inactivity (packets give no reliable close signal at this layer, mirroring UDP relay sessions)
 }
 
 // RelayTarget is one configured TCP/UDP relay: listen locally, forward to
@@ -58,6 +67,9 @@ func Default() Config {
 
 		RelayMaxCapture:     10 << 20,
 		RelayUDPIdleTimeout: 2 * time.Minute,
+
+		SysCaptureMaxCapture:  10 << 20,
+		SysCaptureIdleTimeout: 2 * time.Minute,
 	}
 }
 
@@ -170,6 +182,10 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.Var(relayTargetsFlag{&cfg.RelayTargets}, "relay", `generic TCP/UDP relay target, repeatable: "name=game1,proto=tcp,listen=127.0.0.1:9100,upstream=game.example.com:9100"`)
 	fs.Int64Var(&cfg.RelayMaxCapture, "relay-max-capture", cfg.RelayMaxCapture, "max bytes stored per relay session per direction (still fully forwarded in full)")
 	fs.DurationVar(&cfg.RelayUDPIdleTimeout, "relay-udp-idle-timeout", cfg.RelayUDPIdleTimeout, "evict a UDP relay session after this much inactivity (UDP has no close signal)")
+	fs.BoolVar(&cfg.SysCapture, "syscapture", false, "enable system-level packet capture via WinDivert (Windows only, requires Administrator; see README before enabling: it can intercept traffic from ANY process on the system matching -syscapture-filter, not just traffic pointed at ProxyScope)")
+	fs.StringVar(&cfg.SysCaptureFilter, "syscapture-filter", "", `WinDivert filter expression selecting which packets to capture, e.g. "tcp.DstPort == 9100"; required if -syscapture is set`)
+	fs.Int64Var(&cfg.SysCaptureMaxCapture, "syscapture-max-capture", cfg.SysCaptureMaxCapture, "max bytes stored per captured session per direction (still fully re-injected)")
+	fs.DurationVar(&cfg.SysCaptureIdleTimeout, "syscapture-idle-timeout", cfg.SysCaptureIdleTimeout, "evict a captured session after this much inactivity")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -196,6 +212,15 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	}
 	if cfg.RelayUDPIdleTimeout <= 0 {
 		return cfg, fmt.Errorf("-relay-udp-idle-timeout must be > 0 (UDP sessions have no other way to end)")
+	}
+	if cfg.SysCapture && strings.TrimSpace(cfg.SysCaptureFilter) == "" {
+		return cfg, fmt.Errorf("-syscapture-filter is required when -syscapture is set")
+	}
+	if cfg.SysCaptureMaxCapture < 0 {
+		return cfg, fmt.Errorf("-syscapture-max-capture must be >= 0")
+	}
+	if cfg.SysCaptureIdleTimeout <= 0 {
+		return cfg, fmt.Errorf("-syscapture-idle-timeout must be > 0 (captured sessions have no other reliable way to end)")
 	}
 	seenRelay := map[string]bool{}
 	for _, t := range cfg.RelayTargets {

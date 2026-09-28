@@ -122,3 +122,52 @@ func TestRelayDefaults(t *testing.T) {
 		t.Fatal("negative relay-max-capture should be rejected")
 	}
 }
+
+func TestSysCaptureDefaults(t *testing.T) {
+	def, err := Parse(nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.SysCapture {
+		t.Fatal("-syscapture must default to off")
+	}
+	if def.SysCaptureMaxCapture != 10<<20 {
+		t.Fatalf("SysCaptureMaxCapture = %d", def.SysCaptureMaxCapture)
+	}
+	if def.SysCaptureIdleTimeout != 2*time.Minute {
+		t.Fatalf("SysCaptureIdleTimeout = %v", def.SysCaptureIdleTimeout)
+	}
+}
+
+func TestSysCaptureFlags(t *testing.T) {
+	cfg, err := Parse([]string{"-syscapture", "-syscapture-filter", "tcp.DstPort == 9100"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SysCapture || cfg.SysCaptureFilter != "tcp.DstPort == 9100" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+}
+
+func TestSysCaptureRequiresFilterWhenEnabled(t *testing.T) {
+	if _, err := Parse([]string{"-syscapture"}, io.Discard); err == nil {
+		t.Fatal("-syscapture without -syscapture-filter should be rejected")
+	}
+	if _, err := Parse([]string{"-syscapture", "-syscapture-filter", "  "}, io.Discard); err == nil {
+		t.Fatal("a blank -syscapture-filter should be rejected")
+	}
+	// -syscapture-filter without -syscapture is allowed (e.g. preparing a
+	// filter before flipping the flag on); it just does nothing.
+	if _, err := Parse([]string{"-syscapture-filter", "tcp.DstPort == 9100"}, io.Discard); err != nil {
+		t.Fatalf("filter without enabling capture should be allowed: %v", err)
+	}
+}
+
+func TestSysCaptureValidation(t *testing.T) {
+	if _, err := Parse([]string{"-syscapture-max-capture", "-1"}, io.Discard); err == nil {
+		t.Fatal("negative syscapture-max-capture should be rejected")
+	}
+	if _, err := Parse([]string{"-syscapture-idle-timeout", "0"}, io.Discard); err == nil {
+		t.Fatal("0 syscapture idle timeout should be rejected (sessions would never end)")
+	}
+}

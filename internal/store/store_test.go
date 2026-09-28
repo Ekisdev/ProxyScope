@@ -216,9 +216,51 @@ func TestSchemaV3DatabaseIsMigrated(t *testing.T) {
 	if err := s.OpenSession(ctx, sess); err != nil || sess.ID == 0 {
 		t.Fatalf("OpenSession: %v %+v", err, sess)
 	}
-	sessions, _ := s.ListRelaySessions(ctx, "", 10)
-	if len(sessions) != 1 || sessions[0].ID != sess.ID {
+	sessions, _ := s.ListRelaySessions(ctx, "", "", 10)
+	if len(sessions) != 1 || sessions[0].ID != sess.ID || sessions[0].Source != model.RelaySourceRelay {
 		t.Fatalf("sessions after migration = %+v", sessions)
+	}
+}
+
+func TestSchemaV4DatabaseIsMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// Build a schema-v4 database (as created by Phase 5) with one relay
+	// session row inserted the old way, with no source column at all — this
+	// is the case schemaV1-V3's tests above don't cover, since those build
+	// a database that predates relay_sessions entirely. What matters here is
+	// specifically that ALTER TABLE ... ADD COLUMN source DEFAULT 'relay'
+	// backfills existing rows, not just that new ones can be written.
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{schemaV1, schemaV2, schemaV3, schemaV4} {
+		if _, err := old.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = old.Exec(`INSERT INTO relay_sessions (target, protocol, client_addr, upstream_addr, opened_at_ns, bytes_up, bytes_down)
+		VALUES ('game1', 'tcp', '1.2.3.4:5', 'up:1', 1, 0, 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Exec("PRAGMA user_version = 4")
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	got, err := s.GetRelaySession(ctx, 1)
+	if err != nil || got.Source != model.RelaySourceRelay {
+		t.Fatalf("pre-existing relay session after migration = %+v err=%v, want Source=%q", got, err, model.RelaySourceRelay)
+	}
+	list, _ := s.ListRelaySessions(ctx, "", "", 10)
+	if len(list) != 1 || list[0].Source != model.RelaySourceRelay {
+		t.Fatalf("list after migration = %+v", list)
 	}
 }
 
@@ -242,8 +284,10 @@ func TestRelaySessionAndChunkRoundTrip(t *testing.T) {
 	}
 
 	// Still open: not returned as closed, ClosedAt is nil in the summary.
-	list, err := s.ListRelaySessions(ctx, "game1", 10)
-	if err != nil || len(list) != 1 || list[0].ClosedAt != nil {
+	// An empty Source on write defaults to RelaySourceRelay (mirroring
+	// Exchange.Source's "" = SourceProxy convention).
+	list, err := s.ListRelaySessions(ctx, "", "game1", 10)
+	if err != nil || len(list) != 1 || list[0].ClosedAt != nil || list[0].Source != model.RelaySourceRelay {
 		t.Fatalf("list (open) = %+v err=%v", list, err)
 	}
 
@@ -274,7 +318,7 @@ func TestRelaySessionAndChunkRoundTrip(t *testing.T) {
 	if err != nil || full.ClosedAt.IsZero() || full.BytesUp != 5 || full.BytesDown != 2 {
 		t.Fatalf("get after close = %+v err=%v", full, err)
 	}
-	list, _ = s.ListRelaySessions(ctx, "", 10)
+	list, _ = s.ListRelaySessions(ctx, "", "", 10)
 	if len(list) != 1 || list[0].ClosedAt == nil {
 		t.Fatalf("list (closed) = %+v", list)
 	}
@@ -286,8 +330,28 @@ func TestRelaySessionAndChunkRoundTrip(t *testing.T) {
 	// A different target is excluded by the target filter.
 	other := &model.RelaySession{Target: "game2", Protocol: model.RelayUDP, ClientAddr: "x", UpstreamAddr: "y", OpenedAt: time.Now()}
 	s.OpenSession(ctx, other)
-	filtered, _ := s.ListRelaySessions(ctx, "game1", 10)
+	filtered, _ := s.ListRelaySessions(ctx, "", "game1", 10)
 	if len(filtered) != 1 {
 		t.Fatalf("target filter leaked: %+v", filtered)
+	}
+
+	// A sysCapture-sourced session is excluded by the source filter, and the
+	// unfiltered/target-filtered queries above must not have picked it up.
+	sc := &model.RelaySession{
+		Source: model.RelaySourceSysCapture, Target: `tcp.DstPort == 9100`,
+		Protocol: model.RelayTCP, ClientAddr: "10.0.0.5:4444", UpstreamAddr: "10.0.0.9:9100", OpenedAt: time.Now(),
+	}
+	if err := s.OpenSession(ctx, sc); err != nil {
+		t.Fatal(err)
+	}
+	byRelay, _ := s.ListRelaySessions(ctx, model.RelaySourceRelay, "", 10)
+	for _, row := range byRelay {
+		if row.Source != model.RelaySourceRelay {
+			t.Fatalf("source filter leaked a %q row: %+v", row.Source, row)
+		}
+	}
+	bySysCapture, _ := s.ListRelaySessions(ctx, model.RelaySourceSysCapture, "", 10)
+	if len(bySysCapture) != 1 || bySysCapture[0].ID != sc.ID {
+		t.Fatalf("sysCapture sessions = %+v", bySysCapture)
 	}
 }

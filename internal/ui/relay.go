@@ -160,7 +160,10 @@ func (s *Server) handleRelaySessions(w http.ResponseWriter, r *http.Request) {
 	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
 		limit = v
 	}
-	rows, err := s.store.ListRelaySessions(r.Context(), target, limit)
+	// Scoped to model.RelaySourceRelay (not client-controlled) so the Relay
+	// tab never shows sysCapture sessions mixed in with configured -relay
+	// targets; sysCapture has its own tab and its own /api/syscapture/sessions.
+	rows, err := s.store.ListRelaySessions(r.Context(), model.RelaySourceRelay, target, limit)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -187,6 +190,7 @@ type relayChunkView struct {
 
 type relaySessionDetailView struct {
 	ID           int64            `json:"id"`
+	Source       string           `json:"source"`
 	Target       string           `json:"target"`
 	Protocol     string           `json:"protocol"`
 	ClientAddr   string           `json:"clientAddr"`
@@ -200,13 +204,21 @@ type relaySessionDetailView struct {
 }
 
 func (s *Server) handleRelaySessionDetail(w http.ResponseWriter, r *http.Request) {
+	s.sessionDetail(w, r, model.RelaySourceRelay)
+}
+
+// sessionDetail is shared by the Relay tab's and the System Capture tab's
+// session detail endpoints: same table pair, same chunk rendering (hexView),
+// only the wantSource check differs, keeping the two tabs' data strictly
+// separate even though session ids are one shared sequence across both.
+func (s *Server) sessionDetail(w http.ResponseWriter, r *http.Request, wantSource string) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
 	sess, err := s.store.GetRelaySession(r.Context(), id)
-	if errors.Is(err, model.ErrNotFound) {
+	if errors.Is(err, model.ErrNotFound) || (err == nil && sess.Source != wantSource) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -220,7 +232,7 @@ func (s *Server) handleRelaySessionDetail(w http.ResponseWriter, r *http.Request
 		return
 	}
 	d := relaySessionDetailView{
-		ID: sess.ID, Target: sess.Target, Protocol: string(sess.Protocol),
+		ID: sess.ID, Source: sess.Source, Target: sess.Target, Protocol: string(sess.Protocol),
 		ClientAddr: sess.ClientAddr, UpstreamAddr: sess.UpstreamAddr,
 		OpenedAt: sess.OpenedAt, BytesUp: sess.BytesUp, BytesDown: sess.BytesDown, Error: sess.Error,
 		Chunks: make([]relayChunkView, len(chunks)),

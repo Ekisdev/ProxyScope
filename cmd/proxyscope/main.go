@@ -25,6 +25,7 @@ import (
 	"proxyscope/internal/repeater"
 	"proxyscope/internal/rules"
 	"proxyscope/internal/store"
+	"proxyscope/internal/sysCapture"
 	"proxyscope/internal/ui"
 )
 
@@ -112,12 +113,34 @@ func run() error {
 		MaxCapture: cfg.RelayMaxCapture, UDPIdleTimeout: cfg.RelayUDPIdleTimeout, InterceptTimeout: cfg.InterceptTimeout,
 	}, st, log)
 
-	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, Rules: re, Relay: rel, CAPEM: authority.CertPEM()}, log)
+	// System-level capture (Phase 6) is constructed only when explicitly
+	// enabled: unlike the proxy/relay it is not scoped to traffic pointed at
+	// ProxyScope, so it stays out of ui.Deps entirely (a nil
+	// ui.SysCaptureStatus) rather than existing in a harmless idle state,
+	// making "not wired in" the visibly true state of the UI when off.
+	var sc *sysCapture.Service
+	if cfg.SysCapture {
+		sc = sysCapture.New(sysCapture.Config{
+			Filter: cfg.SysCaptureFilter, MaxCapture: cfg.SysCaptureMaxCapture,
+			IdleTimeout: cfg.SysCaptureIdleTimeout, InterceptTimeout: cfg.InterceptTimeout,
+		}, st, log)
+		log.Warn("system-level capture (-syscapture) is enabled: it can intercept and modify traffic from ANY process on this system matching the filter, not just traffic pointed at ProxyScope — only use this against your own traffic or systems you have explicit authorization to test (see README)",
+			"filter", cfg.SysCaptureFilter)
+		if !sc.Elevated() {
+			log.Warn("system-level capture requires Administrator privileges; WinDivertOpen will fail until this process is elevated")
+		}
+	}
+
+	var scStatus ui.SysCaptureStatus
+	if sc != nil {
+		scStatus = sc
+	}
+	web := ui.New(cfg.UIAddr, ui.Deps{Store: st, Interceptor: icpt, Repeater: rep, Rules: re, Relay: rel, SysCapture: scStatus, CAPEM: authority.CertPEM()}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errc := make(chan error, 3)
+	errc := make(chan error, 4)
 	go func() {
 		if err := px.ListenAndServe(); err != nil {
 			errc <- fmt.Errorf("proxy: %w", err)
@@ -133,6 +156,13 @@ func run() error {
 			errc <- fmt.Errorf("relay: %w", err)
 		}
 	}()
+	if sc != nil {
+		go func() {
+			if err := sc.ListenAndServe(); err != nil {
+				errc <- fmt.Errorf("syscapture: %w", err)
+			}
+		}()
+	}
 
 	var runErr error
 	select {
@@ -149,6 +179,9 @@ func run() error {
 	_ = px.Shutdown(shutCtx)
 	_ = web.Shutdown(shutCtx)
 	_ = rel.Shutdown(shutCtx) // also releases every held relay chunk, see relay.Service.Shutdown
+	if sc != nil {
+		_ = sc.Shutdown(shutCtx) // also releases every held packet payload, see sysCapture.Service.Shutdown
+	}
 	return runErr
 }
 

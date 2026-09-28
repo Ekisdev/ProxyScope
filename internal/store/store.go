@@ -20,7 +20,7 @@ import (
 
 // schemaVersion is stored in PRAGMA user_version. Bump it and add a migration
 // step in migrate() whenever the schema changes.
-const schemaVersion = 4
+const schemaVersion = 5
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS exchanges (
@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS relay_chunks (
 	note           TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS relay_chunks_session_idx ON relay_chunks(session_id, seq);`
+
+// schemaV5 (Phase 6) adds a source column to relay_sessions so Phase 6's
+// system-level (WinDivert) capture can share relay_sessions/relay_chunks
+// with the configured -relay engine instead of getting a third parallel
+// schema: the two engines produce the exact same session/chunk shape (raw
+// bytes grouped by connection), and Source is the discriminator, the same
+// pattern schemaV2 used for exchanges.source (proxy vs repeater). Existing
+// rows are all relay.Service sessions, so they default to 'relay'.
+const schemaV5 = `
+ALTER TABLE relay_sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'relay';`
 
 // Store is a SQLite-backed exchange store. It is safe for concurrent use.
 type Store struct {
@@ -174,6 +184,22 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate to schema v4: %w", err)
 		}
 		if _, err := tx.Exec("PRAGMA user_version = 4"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration: %w", err)
+		}
+	}
+	if v < 5 {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(schemaV5); err != nil {
+			return fmt.Errorf("migrate to schema v5: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 5"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -326,12 +352,19 @@ const (
 )
 
 // OpenSession inserts sess (which may already be closed, e.g. a dial
-// failure recorded in one step) and sets sess.ID. It satisfies relay.Sink.
+// failure recorded in one step) and sets sess.ID. It satisfies relay.Sink
+// and sysCapture.Sink alike (both pass a model.RelaySession; Source tells
+// them apart, see model/relay.go). An empty Source is stored as
+// model.RelaySourceRelay, exactly like Exchange.Source's "" = SourceProxy.
 func (s *Store) OpenSession(ctx context.Context, sess *model.RelaySession) error {
+	source := sess.Source
+	if source == "" {
+		source = model.RelaySourceRelay
+	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO relay_sessions (target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error)
-		 VALUES (?,?,?,?,?,?,?,?,?)`,
-		sess.Target, string(sess.Protocol), sess.ClientAddr, sess.UpstreamAddr, sess.OpenedAt.UnixNano(),
+		`INSERT INTO relay_sessions (source, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		source, sess.Target, string(sess.Protocol), sess.ClientAddr, sess.UpstreamAddr, sess.OpenedAt.UnixNano(),
 		closedAtNs(sess.ClosedAt), sess.BytesUp, sess.BytesDown, sess.Error)
 	if err != nil {
 		return fmt.Errorf("insert relay session: %w", err)
@@ -363,23 +396,31 @@ func (s *Store) SaveChunk(ctx context.Context, c *model.RelayChunk) error {
 	return err
 }
 
-// ListRelaySessions returns session summaries, newest first. target ""
-// means every target; limit is clamped like List's for exchanges.
-func (s *Store) ListRelaySessions(ctx context.Context, target string, limit int) ([]model.RelaySessionSummary, error) {
+// ListRelaySessions returns session summaries, newest first. source ""
+// means every source (relay and sysCapture together); target "" means every
+// target within that source. limit is clamped like List's for exchanges.
+func (s *Store) ListRelaySessions(ctx context.Context, source, target string, limit int) ([]model.RelaySessionSummary, error) {
 	if limit <= 0 {
 		limit = defaultRelaySessionLimit
 	}
 	limit = min(limit, maxRelaySessionLimit)
-	const cols = `id, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error`
-	var (
-		rows *sql.Rows
-		err  error
-	)
-	if target != "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM relay_sessions WHERE target = ? ORDER BY id DESC LIMIT ?`, target, limit)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM relay_sessions ORDER BY id DESC LIMIT ?`, limit)
+	const cols = `id, source, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error`
+	where := ""
+	args := []any{}
+	if source != "" {
+		where += " WHERE source = ?"
+		args = append(args, source)
 	}
+	if target != "" {
+		if where == "" {
+			where += " WHERE target = ?"
+		} else {
+			where += " AND target = ?"
+		}
+		args = append(args, target)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM relay_sessions`+where+` ORDER BY id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list relay sessions: %w", err)
 	}
@@ -393,7 +434,7 @@ func (s *Store) ListRelaySessions(ctx context.Context, target string, limit int)
 			openedNs int64
 			closedNs sql.NullInt64
 		)
-		if err := rows.Scan(&m.ID, &m.Target, &protocol, &m.ClientAddr, &m.UpstreamAddr, &openedNs, &closedNs, &m.BytesUp, &m.BytesDown, &m.Error); err != nil {
+		if err := rows.Scan(&m.ID, &m.Source, &m.Target, &protocol, &m.ClientAddr, &m.UpstreamAddr, &openedNs, &closedNs, &m.BytesUp, &m.BytesDown, &m.Error); err != nil {
 			return nil, fmt.Errorf("scan relay session: %w", err)
 		}
 		m.Protocol = protocol
@@ -416,9 +457,9 @@ func (s *Store) GetRelaySession(ctx context.Context, id int64) (*model.RelaySess
 		closedNs sql.NullInt64
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error
+		`SELECT id, source, target, protocol, client_addr, upstream_addr, opened_at_ns, closed_at_ns, bytes_up, bytes_down, error
 		 FROM relay_sessions WHERE id = ?`, id).
-		Scan(&sess.ID, &sess.Target, &protocol, &sess.ClientAddr, &sess.UpstreamAddr, &openedNs, &closedNs, &sess.BytesUp, &sess.BytesDown, &sess.Error)
+		Scan(&sess.ID, &sess.Source, &sess.Target, &protocol, &sess.ClientAddr, &sess.UpstreamAddr, &openedNs, &closedNs, &sess.BytesUp, &sess.BytesDown, &sess.Error)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, model.ErrNotFound
 	}

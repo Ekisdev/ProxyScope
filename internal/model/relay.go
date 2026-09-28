@@ -94,12 +94,24 @@ type RelayResolution struct {
 
 // RelaySession is one relayed TCP connection or UDP client grouping, as
 // stored. ClosedAt is the zero Time while the session is still open.
+//
+// Source distinguishes a session opened by the configured -relay engine
+// (RelaySourceRelay, the default/empty value, exactly like Exchange.Source's
+// "" = SourceProxy convention) from one opened by Phase 6's system-level
+// capture (RelaySourceSysCapture). Both engines produce the same session/
+// chunk shape (raw bytes grouped by connection, see model/relay.go's doc
+// comment), so they share these two tables rather than each getting their
+// own; Source is the discriminator, the same pattern Phase 3 used to tell
+// live-captured exchanges from repeater replays in one exchanges table. For
+// a sysCapture session, Target holds the WinDivert filter string that
+// captured it (there is no configured target name at that layer).
 type RelaySession struct {
 	ID           int64
-	Target       string // configured relay target name
+	Source       string // RelaySourceRelay ("", default) or RelaySourceSysCapture
+	Target       string // configured relay target name, or the capturing filter string
 	Protocol     RelayProtocol
-	ClientAddr   string // client ip:port; a UDP session is grouped by this
-	UpstreamAddr string // host:port this session was relayed to
+	ClientAddr   string // client ip:port; a UDP/sysCapture session is grouped by this
+	UpstreamAddr string // host:port this session was relayed to (or the packet's own remote ip:port for sysCapture)
 	OpenedAt     time.Time
 	ClosedAt     time.Time // zero value = still open
 	BytesUp      int64     // real total bytes seen, client -> upstream (>= captured)
@@ -107,9 +119,16 @@ type RelaySession struct {
 	Error        string    // set if the session ended abnormally (dial failure, ...)
 }
 
+// Values for RelaySession.Source / RelaySessionSummary.Source.
+const (
+	RelaySourceRelay      = "relay"      // opened by a configured -relay target
+	RelaySourceSysCapture = "syscapture" // opened by Phase 6 system-level capture
+)
+
 // RelaySessionSummary is the lightweight row shown in the session list.
 type RelaySessionSummary struct {
 	ID           int64      `json:"id"`
+	Source       string     `json:"source"`
 	Target       string     `json:"target"`
 	Protocol     string     `json:"protocol"`
 	ClientAddr   string     `json:"clientAddr"`
