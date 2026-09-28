@@ -142,7 +142,18 @@ func (s *Service) processPacket(pkt []byte, outbound bool) (out []byte, drop boo
 		dir = model.RelayUp
 	}
 	sess := s.sessionFor(p, outbound)
-	chunk := &model.Chunk{Data: append([]byte(nil), p.payload(pkt)...)}
+	// make+copy, not append(nil, payload...): appending zero elements to a
+	// nil slice returns nil, not an empty slice. A zero-length payload is
+	// ordinary here (a bare TCP ACK/SYN/FIN carries none, and WinDivert
+	// hands over every packet matching the filter, not just ones with
+	// application data), and a nil Chunk.Data would reach store.SaveChunk
+	// and be bound as SQL NULL, violating relay_chunks.data's NOT NULL
+	// constraint (see store.SaveChunk's doc comment for the storage-side
+	// half of this fix, kept as a defensive backstop for other callers).
+	payload := p.payload(pkt)
+	data := make([]byte, len(payload))
+	copy(data, payload)
+	chunk := &model.Chunk{Data: data}
 	oc := s.hold.Hold(s.ctx, sess.id, dir, p.Protocol, s.cfg.Filter, chunk)
 
 	if oc.Verdict == model.VerdictDrop {

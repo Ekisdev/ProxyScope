@@ -143,6 +143,44 @@ func TestProcessPacketOpensOneSessionForBothDirections(t *testing.T) {
 	}
 }
 
+// TestProcessPacketZeroPayloadChunkDataIsNeverNil is a regression test for a
+// bug where a zero-payload TCP control packet (a bare ACK/SYN/FIN -- WinDivert
+// captures every packet matching the filter, not just ones carrying
+// application data) produced a Chunk with Data == nil (append(nil,
+// emptySlice...) returns nil, not an empty slice), which store.SaveChunk then
+// bound as SQL NULL, violating relay_chunks.data's NOT NULL constraint (see
+// internal/store's own regression test for the storage side of this fix).
+// fakeSink doesn't enforce that constraint, so this test instead pins the
+// contract callers must not regress: processPacket must never hand a Sink a
+// Chunk whose Data is nil, even when the packet carried no payload at all.
+func TestProcessPacketZeroPayloadChunkDataIsNeverNil(t *testing.T) {
+	sink := newFakeSink()
+	s := testService(t, Config{}, sink)
+
+	pkt := buildIPv4TCP(t, "10.0.0.5", "1.2.3.4", 4444, 9100, 0x10, nil) // 0x10 = ACK, no payload
+	out, drop := s.processPacket(pkt, true)
+	if drop || string(out) != string(pkt) {
+		t.Fatalf("out=%v drop=%v, want unmodified passthrough", out, drop)
+	}
+
+	var sess *model.RelaySession
+	sink.mu.Lock()
+	for _, v := range sink.sessions {
+		sess = v
+	}
+	sink.mu.Unlock()
+	chunks := sink.chunksFor(sess.ID)
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %+v, want exactly 1", chunks)
+	}
+	if chunks[0].Data == nil {
+		t.Fatal("Data is nil for a zero-payload packet; store.SaveChunk would bind this as SQL NULL and violate NOT NULL")
+	}
+	if len(chunks[0].Data) != 0 {
+		t.Fatalf("Data = %q, want empty", chunks[0].Data)
+	}
+}
+
 func TestProcessPacketDifferentFlowsGetDifferentSessions(t *testing.T) {
 	sink := newFakeSink()
 	s := testService(t, Config{}, sink)

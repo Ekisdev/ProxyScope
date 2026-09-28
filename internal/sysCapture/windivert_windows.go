@@ -4,6 +4,7 @@ package sysCapture
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -36,6 +37,49 @@ var (
 
 const invalidHandleValue = ^uintptr(0)
 
+// allProcs lists every LazyProc ensureLoaded must resolve before this
+// package makes its first WinDivert call.
+var allProcs = []*syscall.LazyProc{
+	procWinDivertOpen, procWinDivertRecv, procWinDivertSend, procWinDivertClose, procWinDivertHelperCalcChecksums,
+}
+
+var (
+	loadOnce sync.Once
+	loadErr  error
+)
+
+// ensureLoaded loads WinDivert.dll and resolves every proc this package
+// uses, returning a normal error on failure instead of letting the DLL/proc
+// be resolved lazily.
+//
+// syscall.LazyProc.Call finds its DLL/proc lazily via mustFind/mustLoad,
+// which PANIC (not return an error) if the DLL can't be loaded (missing
+// file, wrong architecture, ...) or the proc can't be found in it -- that
+// is deliberate stdlib behavior for "this must always succeed" APIs like
+// kernel32, but wrong here: a missing or 32-bit WinDivert.dll next to a
+// 64-bit proxyscope.exe (see README's "Installing WinDivert") is exactly
+// the kind of ordinary, expected-to-happen setup error this project's rule
+// is "return errors, don't panic" for (see CLAUDE.md). LazyDLL.Load and
+// LazyProc.Find, unlike Call, return an error instead of panicking, so
+// calling them explicitly here -- once, before any Call -- lets
+// winDivertOpen (and therefore Service.ListenAndServe) report a clear,
+// wrapped error instead of crashing the whole process.
+func ensureLoaded() error {
+	loadOnce.Do(func() {
+		if err := winDivertDLL.Load(); err != nil {
+			loadErr = fmt.Errorf("loading WinDivert.dll: %w", err)
+			return
+		}
+		for _, p := range allProcs {
+			if err := p.Find(); err != nil {
+				loadErr = fmt.Errorf("resolving %s in WinDivert.dll: %w", p.Name, err)
+				return
+			}
+		}
+	})
+	return loadErr
+}
+
 // windivertAddress mirrors WINDIVERT_ADDRESS (WinDivert 2.x): an 8-byte
 // timestamp, a 4-byte bitfield packing Layer/Event/Sniffed/Outbound/
 // Loopback/Impostor/IPv6/IPChecksum/TCPChecksum/UDPChecksum/Reserved1 (in
@@ -61,6 +105,9 @@ func (a *windivertAddress) outbound() bool { return a.layerAndFlags&windivertAdd
 // WinDivertOpen itself enforces that, and its error is returned unchanged
 // (ListenAndServe wraps it with a clearer message).
 func winDivertOpen(filter string) (uintptr, error) {
+	if err := ensureLoaded(); err != nil {
+		return 0, err
+	}
 	filterPtr, err := syscall.BytePtrFromString(filter)
 	if err != nil {
 		return 0, fmt.Errorf("invalid filter: %w", err)
@@ -81,7 +128,10 @@ func winDivertOpen(filter string) (uintptr, error) {
 // filled and its address metadata (direction, interface, ...). The
 // returned slice aliases buf; the caller (capture_windows.go's receive
 // loop) must finish using it (or copy what it needs) before calling
-// winDivertRecv again with the same buf.
+// winDivertRecv again with the same buf. Like winDivertSend/winDivertClose
+// below, it is only ever called after winDivertOpen has already succeeded
+// (so ensureLoaded has already resolved every proc it uses), hence no
+// ensureLoaded call of its own.
 func winDivertRecv(handle uintptr, buf []byte) ([]byte, windivertAddress, error) {
 	var addr windivertAddress
 	var recvLen uint32

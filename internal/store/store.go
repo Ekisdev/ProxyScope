@@ -384,11 +384,25 @@ func (s *Store) CloseSession(ctx context.Context, id int64, closedAt time.Time, 
 }
 
 // SaveChunk inserts c and sets c.ID. It satisfies relay.Sink.
+//
+// A nil c.Data (a zero-length chunk, e.g. a sysCapture TCP control packet
+// with no payload -- append(nil, emptySlice...) returns nil, not an empty
+// slice) is normalized to a non-nil empty slice before binding: the
+// database/sql driver binds a nil []byte as SQL NULL, which violates
+// relay_chunks.data's NOT NULL constraint, while a non-nil empty []byte
+// binds as a legitimate zero-length BLOB. relay's own chunks come from a
+// successful Read(), which never yields a nil/zero-length buffer, so only
+// sysCapture hits this in practice, but the fix belongs here, at the one
+// place every caller's Data reaches the database.
 func (s *Store) SaveChunk(ctx context.Context, c *model.RelayChunk) error {
+	data := c.Data
+	if data == nil {
+		data = []byte{}
+	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO relay_chunks (session_id, seq, direction, ts_ns, data, data_size, edited, note)
 		 VALUES (?,?,?,?,?,?,?,?)`,
-		c.SessionID, c.Seq, string(c.Direction), c.Timestamp.UnixNano(), c.Data, c.DataSize, c.Edited, c.Note)
+		c.SessionID, c.Seq, string(c.Direction), c.Timestamp.UnixNano(), data, c.DataSize, c.Edited, c.Note)
 	if err != nil {
 		return fmt.Errorf("insert relay chunk: %w", err)
 	}

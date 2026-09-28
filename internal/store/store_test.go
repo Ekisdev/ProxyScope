@@ -327,6 +327,26 @@ func TestRelaySessionAndChunkRoundTrip(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 
+	// A nil Data (e.g. a sysCapture TCP control packet with no payload --
+	// see the doc comment on SaveChunk) must not violate relay_chunks.data's
+	// NOT NULL constraint: database/sql binds a nil []byte as SQL NULL,
+	// which SaveChunk must normalize to a non-nil empty slice before
+	// binding. Regression test for that bug -- the fix is specifically
+	// about the INSERT succeeding; the driver may still hand back nil for a
+	// zero-length BLOB on read (modernc.org/sqlite does), which is fine and
+	// not asserted here.
+	empty := &model.RelayChunk{SessionID: sess.ID, Seq: 3, Direction: model.RelayUp, Timestamp: time.Now(), Data: nil, DataSize: 0}
+	if err := s.SaveChunk(ctx, empty); err != nil || empty.ID == 0 {
+		t.Fatalf("SaveChunk with nil Data: %v %+v", err, empty)
+	}
+	chunks, err = s.ListRelayChunks(ctx, sess.ID)
+	if err != nil || len(chunks) != 3 {
+		t.Fatalf("chunks after nil-data save = %+v err=%v", chunks, err)
+	}
+	if len(chunks[2].Data) != 0 {
+		t.Fatalf("chunk 2 (nil Data round trip) = %+v", chunks[2])
+	}
+
 	// A different target is excluded by the target filter.
 	other := &model.RelaySession{Target: "game2", Protocol: model.RelayUDP, ClientAddr: "x", UpstreamAddr: "y", OpenedAt: time.Now()}
 	s.OpenSession(ctx, other)

@@ -92,7 +92,16 @@ exit /b 0
 echo.
 go version
 echo.
-echo Building proxyscope.exe ...
+REM Force a 64-bit build regardless of the installed Go toolchain's own
+REM default GOARCH: -syscapture (WinDivert) only ships/documents a 64-bit
+REM WinDivert.dll/WinDivert64.sys (see README's "Installing WinDivert"), and
+REM a 32-bit proxyscope.exe can't load a 64-bit DLL. A cross-toolchain Go
+REM build (e.g. a 386 host Go producing an amd64 binary) works fine here
+REM since this project uses no CGO. This does not change go.exe's own
+REM GOARCH, only this one build.
+set "GOARCH=amd64"
+set "GOOS=windows"
+echo Building proxyscope.exe (GOARCH=%GOARCH%) ...
 go build -o proxyscope.exe .\cmd\proxyscope
 if errorlevel 1 (
     echo.
